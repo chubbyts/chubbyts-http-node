@@ -1,5 +1,5 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
-import { Readable, pipeline } from 'node:stream';
+import { Readable, Transform, pipeline } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { Body, Headers, Response, ServerRequest } from '@chubbyts/chubbyts-http-types/message';
 import type { ServerRequestFactory, UriFactory } from '@chubbyts/chubbyts-http-types/message-factory';
@@ -98,6 +98,56 @@ const getProtocolVersion = (nodeRequest: IncomingMessage): string => {
   return httpVersion === '2.0' ? '2' : httpVersion;
 };
 
+// node does not limit the body size itself: a too large body destroys the request, which closes the connection as the
+// client would otherwise keep on sending the body, the error reaches the handler while iterating the body
+const limitBody = (
+  nodeRequest: IncomingMessage,
+  contentLength: string | undefined,
+  requestBodyMaxBytes: number,
+): Body => {
+  const createError = (): Error => new Error(`Request body exceeds the maximum of ${requestBodyMaxBytes} bytes`);
+
+  const received = { bytes: 0 };
+
+  // a chunked body (or one with a wrong content-length) gets limited while reading it
+  const limitedBody = new Transform({
+    transform: (chunk: Buffer, _encoding, callback) => {
+      // oxlint-disable-next-line functional/immutable-data
+      received.bytes += chunk.length;
+
+      if (received.bytes > requestBodyMaxBytes) {
+        const error = createError();
+
+        // both sides get destroyed right away (an errored transform callback and pipeline would defer it to the next
+        // ticks): the connection gets closed before the handler, getting the error while iterating the body, could
+        // respond while the client is still sending
+        nodeRequest.destroy(error);
+        limitedBody.destroy(error);
+
+        return;
+      }
+
+      callback(null, chunk);
+    },
+  });
+
+  // pipeline destroys both sides on failure: an exceeded limit destroys the request, a destroyed request (client
+  // abort, request body timeout) the limited body, the callback only consumes the error (pipeline keeps listening
+  // for errors: no unhandled 'error' event, iterating the body still rejects with the error)
+  pipeline(nodeRequest, limitedBody, () => {});
+
+  // a declared too large body gets rejected before reading it (pipeline starts reading on the next tick), the body is
+  // the limited body as well: the same type, regardless of how the limit got exceeded
+  if (Number(contentLength) > requestBodyMaxBytes) {
+    const error = createError();
+
+    nodeRequest.destroy(error);
+    limitedBody.destroy(error);
+  }
+
+  return limitedBody;
+};
+
 type NodeRequestToServerRequestFactory = (nodeRequest: IncomingMessage, nodeResponse: ServerResponse) => ServerRequest;
 
 export const createNodeRequestToServerRequestFactory = (
@@ -106,7 +156,13 @@ export const createNodeRequestToServerRequestFactory = (
   requestHelpers: RequestHelpers,
   baseUrl: string | undefined = undefined,
   requestBodyTimeoutMs: number | undefined = undefined,
+  requestBodyMaxBytes: number | undefined = undefined,
 ): NodeRequestToServerRequestFactory => {
+  // fail fast: NaN would silently disable the limit (every comparison with it is false)
+  if (requestBodyMaxBytes !== undefined && (!Number.isSafeInteger(requestBodyMaxBytes) || requestBodyMaxBytes < 0)) {
+    throw new Error(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative safe integer`);
+  }
+
   return (nodeRequest: IncomingMessage, nodeResponse: ServerResponse): ServerRequest => {
     const { method } = nodeRequest;
 
@@ -159,6 +215,13 @@ export const createNodeRequestToServerRequestFactory = (
       timeout.unref();
 
       nodeRequest.on('close', () => clearTimeout(timeout));
+    }
+
+    if (requestBodyMaxBytes !== undefined) {
+      return requestHelpers.withBody(
+        serverRequest,
+        limitBody(nodeRequest, headers.get('content-length')?.[0], requestBodyMaxBytes),
+      );
     }
 
     // an IncomingMessage already is an AsyncIterable<Buffer>

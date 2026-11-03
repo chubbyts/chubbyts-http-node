@@ -156,6 +156,21 @@ const expectAllMocksCalled = (mocks: ReadonlyArray<ReadonlyArray<unknown>>) => {
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+// a real stream as request: the limited body gets piped with the real pipeline
+const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = []): IncomingMessage =>
+  Object.assign(body, {
+    method: 'POST',
+    rawHeaders,
+    url: '/path/to/route',
+    httpVersion: '1.1',
+  }) as unknown as IncomingMessage;
+
+const useActualPipeline = async () => {
+  const { pipeline } = await vi.importActual<{ pipeline: typeof pipelineHolder.pipeline }>('node:stream');
+
+  pipelineHolder.pipeline = pipeline;
+};
+
 describe('node', () => {
   describe('getUrl', () => {
     test('with base url', () => {
@@ -682,6 +697,242 @@ describe('node', () => {
       await wait(100);
 
       expect(nodeRequestMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+    test.each([
+      [['ab', 'cd'], []],
+      [
+        ['ab', 'cd'],
+        ['content-length', '4'],
+      ],
+    ])(
+      'with body, with request body max bytes, with body %j within the limit, with headers %j',
+      async (chunks, rawHeaders) => {
+        await useActualPipeline();
+
+        const nodeRequest = createStreamNodeRequest(
+          Readable.from(chunks.map((chunk) => Buffer.from(chunk))),
+          rawHeaders,
+        );
+
+        const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+          { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+        ]);
+
+        const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+          url: 'https://example.com/path/to/route',
+          method: 'POST',
+          protocolVersion: '1.1',
+          headers: rawHeaders.length > 0 ? [['content-length', ['4']]] : [],
+          withBody: true,
+        });
+
+        const serverRequest = createNodeRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          'https://example.com',
+          undefined,
+          4,
+        )(nodeRequest, nodeResponse);
+
+        expect(serverRequest.body).not.toBe(nodeRequest);
+        expect(await text(serverRequest.body)).toBe('abcd');
+
+        expect(nodeResponseMocks).toHaveLength(0);
+        expectAllMocksCalled(mocks);
+      },
+    );
+
+    test('with body, with request body max bytes of 0, with empty body', async () => {
+      await useActualPipeline();
+
+      const nodeRequest = createStreamNodeRequest(Readable.from([]));
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'POST',
+        protocolVersion: '1.1',
+        withBody: true,
+      });
+
+      const serverRequest = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+        undefined,
+        0,
+      )(nodeRequest, nodeResponse);
+
+      expect(await text(serverRequest.body)).toBe('');
+
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with too large received body', async () => {
+      await useActualPipeline();
+
+      const nodeRequest = createStreamNodeRequest(Readable.from([Buffer.from('abc'), Buffer.from('de')]));
+
+      // records the state of the limited body when the request gets destroyed (first call only)
+      const state: { body?: Readable; bodyDestroyedOnDestroy?: boolean; bodyDestroyedOnNextTick?: boolean } = {};
+      const destroy = nodeRequest.destroy.bind(nodeRequest);
+
+      nodeRequest.destroy = (error?: Error) => {
+        if (state.bodyDestroyedOnDestroy === undefined) {
+          state.bodyDestroyedOnDestroy = state.body?.destroyed;
+
+          // scheduled before the events of the destroyed request: runs before pipeline reacts to them
+          process.nextTick(() => {
+            state.bodyDestroyedOnNextTick = state.body?.destroyed;
+          });
+        }
+
+        return destroy(error);
+      };
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'POST',
+        protocolVersion: '1.1',
+        withBody: true,
+      });
+
+      const serverRequest = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+        undefined,
+        4,
+      )(nodeRequest, nodeResponse);
+
+      state.body = serverRequest.body as Readable;
+
+      await expect(text(serverRequest.body)).rejects.toThrow('Request body exceeds the maximum of 4 bytes');
+
+      // the request (and therefore the connection) got destroyed right away, before the body errored (not only by
+      // pipeline afterwards): the handler cannot respond while the client is still sending, the body errored right
+      // away as well (not only by pipeline reacting to the destroyed request)
+      expect(nodeRequest.destroyed).toBe(true);
+      expect(state).toEqual({ body: serverRequest.body, bodyDestroyedOnDestroy: false, bodyDestroyedOnNextTick: true });
+
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with too large content-length', async () => {
+      await useActualPipeline();
+
+      const chunks = { read: 0 };
+
+      const nodeRequest = createStreamNodeRequest(
+        new Readable({
+          read() {
+            chunks.read++;
+            this.push(null);
+          },
+        }),
+        ['content-length', '5'],
+      );
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'POST',
+        protocolVersion: '1.1',
+        headers: [['content-length', ['5']]],
+        withBody: true,
+      });
+
+      const serverRequest = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+        undefined,
+        4,
+      )(nodeRequest, nodeResponse);
+
+      // rejected before reading the body, the body is the limited body as well (same type as within the limit)
+      expect(nodeRequest.destroyed).toBe(true);
+      expect(serverRequest.body).not.toBe(nodeRequest);
+      expect((serverRequest.body as Readable).destroyed).toBe(true);
+
+      await expect(text(serverRequest.body)).rejects.toThrow('Request body exceeds the maximum of 4 bytes');
+
+      expect(chunks.read).toBe(0);
+
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+      'with invalid request body max bytes %s',
+      (requestBodyMaxBytes) => {
+        const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+        const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+        const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+        expect(() =>
+          createNodeRequestToServerRequestFactory(
+            uriFactory,
+            serverRequestFactory,
+            requestHelpers,
+            'https://example.com',
+            undefined,
+            requestBodyMaxBytes,
+          ),
+        ).toThrow(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative safe integer`);
+
+        expect(uriFactoryMocks).toHaveLength(0);
+        expect(serverRequestFactoryMocks).toHaveLength(0);
+        expect(requestHelpersMocks).toHaveLength(0);
+      },
+    );
+
+    test('with body, with request body max bytes, with request body timeout, with stalling request', async () => {
+      await useActualPipeline();
+
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'POST',
+        protocolVersion: '1.1',
+        withBody: true,
+      });
+
+      const serverRequest = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+        10,
+        4,
+      )(nodeRequest, nodeResponse);
+
+      // the destroyed request destroys the limited body
+      await expect(text(serverRequest.body)).rejects.toThrow('Request body has not been fully received within 10ms');
+
       expect(nodeResponseMocks).toHaveLength(0);
       expectAllMocksCalled(mocks);
     });

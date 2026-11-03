@@ -34,6 +34,7 @@ const nodeRequestToServerRequestFactory = createNodeRequestToServerRequestFactor
   createServerRequestHelpers(),
   'https://example.com',
   30_000,
+  1024 * 1024,
 );
 
 const responseFactory = createResponseFactory();

@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-node][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-node@^1.0.0
+npm i @chubbyts/chubbyts-http-node@^1.1.0
 ```
 
 ## Usage
@@ -77,6 +77,8 @@ const nodeRequestToServerRequestFactory = createNodeRequestToServerRequestFactor
   'https://example.com',
   // optional: the request body must be fully received within 30s
   30_000,
+  // optional: the request body must not exceed 1MiB
+  1024 * 1024,
 );
 
 // for example @chubbyts/chubbyts-framework app (which implements Handler)
@@ -124,8 +126,8 @@ The server request gets created by `serverRequestFactory(method, uriFactory(url)
    `proxy-authorization` headers get rejected. http/2 pseudo-headers (`:method`, `:path`, `:authority`, `:scheme`) get
    skipped.
  * `protocolVersion` is the http version of node, `2.0` becomes `2`.
- * `body` is the `IncomingMessage` itself (an `AsyncIterable<Buffer>`), `GET` and `HEAD` keep the (empty) body of the
-   factory.
+ * `body` is the `IncomingMessage` itself (an `AsyncIterable<Buffer>`), with a request body max bytes limit a
+   `Transform` piped from it, `GET` and `HEAD` keep the (empty) body of the factory.
  * `signal` gets aborted when the `ServerResponse` gets closed before it has been fully sent (client disconnected,
    response destroyed), which is why the factory takes the `ServerResponse` as well.
 
@@ -135,7 +137,16 @@ The body gets piped into the `ServerResponse`. A node stream body is used as is 
 with `Readable.fromWeb`, so both get stopped (destroyed / cancelled) when the client disconnects, even while a read is
 pending. Any other `AsyncIterable` can only be stopped once its pending chunk arrives.
 
-### Timeouts
+### Limits and timeouts
+
+Node does not limit the request body size itself, a client could otherwise fill the memory of a handler reading the
+whole body:
+
+ * `createNodeRequestToServerRequestFactory(uriFactory, serverRequestFactory, requestHelpers, baseUrl, requestBodyTimeoutMs, requestBodyMaxBytes)`:
+   a request with a larger `content-length` gets rejected before reading the body, a chunked body (or one with a wrong
+   `content-length`) while reading it. The request gets destroyed, which closes the connection (the client would
+   otherwise keep on sending the body), and the error surfaces to the handler while iterating the body. The limit must
+   be a non-negative safe integer, otherwise the factory throws.
 
 Slow clients (slowloris) can otherwise tie up sockets indefinitely:
 
@@ -145,7 +156,7 @@ Slow clients (slowloris) can otherwise tie up sockets indefinitely:
  * `createResponseToNodeResponseEmitter(responseSendTimeoutMs)`: if the response has not been fully sent
    within the given time (slow reading client or stalling response body), the response gets destroyed.
 
-Both timeouts are optional and disabled by default. They only cover the body phases handled by this adapter,
+The limit and both timeouts are optional and disabled by default. They only cover the body phases handled by this adapter,
 so make sure the node server level timeouts are configured as well: `server.headersTimeout` (slow header
 senders), `server.requestTimeout` and `server.keepAliveTimeout`.
 

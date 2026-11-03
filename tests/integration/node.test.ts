@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import fetch from 'cross-fetch';
 import { expect, test } from 'vitest';
 
@@ -97,4 +98,35 @@ test('post', async () => {
       },
     }
   `);
+});
+
+// the server must survive a request exceeding the body limit
+const expectServerAlive = async () => {
+  const response = await fetch(`${process.env.HTTP_URI}/path/to/post/route`, { method: 'POST', body: 'test' });
+
+  expect(response.status).toBe(200);
+  expect((await response.json()).body).toBe('test');
+};
+
+test('post, with too large body', async () => {
+  await expect(
+    fetch(`${process.env.HTTP_URI}/path/to/post/route`, {
+      method: 'POST',
+      body: 'a'.repeat(2 * 1024 * 1024),
+    }),
+  ).rejects.toThrow();
+
+  await expectServerAlive();
+});
+
+test('post, with too large chunked body', async () => {
+  // a stream body without content-length gets sent chunked: limited while reading it
+  await expect(
+    fetch(`${process.env.HTTP_URI}/path/to/post/route`, {
+      method: 'POST',
+      body: Readable.from(Array.from({ length: 32 }, () => Buffer.alloc(64 * 1024, 'a'))) as unknown as BodyInit,
+    }),
+  ).rejects.toThrow();
+
+  await expectServerAlive();
 });
