@@ -2,9 +2,9 @@
 
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
 import type { TLSSocket } from 'node:tls';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { text } from 'node:stream/consumers';
-import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 import { useFunctionMock } from '@chubbyts/chubbyts-function-mock/dist/function-mock';
 import type { ObjectMocks } from '@chubbyts/chubbyts-function-mock/dist/object-mock';
 import { useObjectMock } from '@chubbyts/chubbyts-function-mock/dist/object-mock';
@@ -17,20 +17,7 @@ import {
   getUrl,
 } from '../../src/node.js';
 
-type Pipeline = (source: Body, destination: ServerResponse, callback: (error: Error | null) => void) => unknown;
-
 type Listener = (...args: Array<unknown>) => void;
-
-const pipelineHolder = vi.hoisted((): { pipeline?: (...args: Array<unknown>) => unknown } => ({}));
-
-vi.mock('node:stream', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  pipeline: (...args: Array<unknown>) => pipelineHolder.pipeline?.(...args),
-}));
-
-beforeEach(() => {
-  pipelineHolder.pipeline = undefined;
-});
 
 const createSocket = (socket: { localAddress?: string; localPort?: number; encrypted?: boolean }) =>
   socket as TLSSocket;
@@ -63,6 +50,25 @@ const createWriteHead = (
     // the emitter does not use the returned response
     return undefined as unknown as ServerResponse;
   }) as ServerResponse['writeHead'];
+
+// a writable as response: like a ServerResponse, it does not get destroyed once finished, but gets closed
+const createStreamNodeResponse = (writeHead: ServerResponse['writeHead']) => {
+  const chunks: Array<Buffer> = [];
+
+  const nodeResponse = new Writable({
+    autoDestroy: false,
+    write: (chunk: Buffer, _encoding, callback) => {
+      chunks.push(chunk);
+      callback();
+    },
+  });
+
+  nodeResponse.once('finish', () => nodeResponse.emit('close'));
+
+  const closed = new Promise<void>((resolve) => nodeResponse.once('close', () => resolve()));
+
+  return { nodeResponse: Object.assign(nodeResponse, { writeHead }) as unknown as ServerResponse, chunks, closed };
+};
 
 const uri: Uri = {
   scheme: 'https',
@@ -156,7 +162,7 @@ const expectAllMocksCalled = (mocks: ReadonlyArray<ReadonlyArray<unknown>>) => {
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-// a real stream as request: the limited body gets piped with the real pipeline
+// a real stream as request: the limited body gets piped from it
 const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = []): IncomingMessage =>
   Object.assign(body, {
     method: 'POST',
@@ -165,10 +171,29 @@ const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = [])
     httpVersion: '1.1',
   }) as unknown as IncomingMessage;
 
-const useActualPipeline = async () => {
-  const { pipeline } = await vi.importActual<{ pipeline: typeof pipelineHolder.pipeline }>('node:stream');
+// a stream request with a request body max bytes of 4, the implementation mocks verify the calls
+const createLimitedServerRequest = (nodeRequest: IncomingMessage) => {
+  const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+    { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+  ]);
 
-  pipelineHolder.pipeline = pipeline;
+  const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+    url: 'https://example.com/path/to/route',
+    method: 'POST',
+    protocolVersion: '1.1',
+    withBody: true,
+  });
+
+  const serverRequest = createNodeRequestToServerRequestFactory(
+    uriFactory,
+    serverRequestFactory,
+    requestHelpers,
+    'https://example.com',
+    undefined,
+    4,
+  )(nodeRequest, nodeResponse);
+
+  return { serverRequest, mocks: [nodeResponseMocks, ...mocks] };
 };
 
 describe('node', () => {
@@ -709,8 +734,6 @@ describe('node', () => {
     ])(
       'with body, with request body max bytes, with body %j within the limit, with headers %j',
       async (chunks, rawHeaders) => {
-        await useActualPipeline();
-
         const nodeRequest = createStreamNodeRequest(
           Readable.from(chunks.map((chunk) => Buffer.from(chunk))),
           rawHeaders,
@@ -746,8 +769,6 @@ describe('node', () => {
     );
 
     test('with body, with request body max bytes of 0, with empty body', async () => {
-      await useActualPipeline();
-
       const nodeRequest = createStreamNodeRequest(Readable.from([]));
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
@@ -777,8 +798,6 @@ describe('node', () => {
     });
 
     test('with body, with request body max bytes, with too large received body', async () => {
-      await useActualPipeline();
-
       const nodeRequest = createStreamNodeRequest(Readable.from([Buffer.from('abc'), Buffer.from('de')]));
 
       // records the state of the limited body when the request gets destroyed (first call only)
@@ -789,7 +808,7 @@ describe('node', () => {
         if (state.bodyDestroyedOnDestroy === undefined) {
           state.bodyDestroyedOnDestroy = state.body?.destroyed;
 
-          // scheduled before the events of the destroyed request: runs before pipeline reacts to them
+          // scheduled before the events of the destroyed request: runs before the listeners react to them
           process.nextTick(() => {
             state.bodyDestroyedOnNextTick = state.body?.destroyed;
           });
@@ -823,8 +842,8 @@ describe('node', () => {
       await expect(text(serverRequest.body)).rejects.toThrow('Request body exceeds the maximum of 4 bytes');
 
       // the request (and therefore the connection) got destroyed right away, before the body errored (not only by
-      // pipeline afterwards): the handler cannot respond while the client is still sending, the body errored right
-      // away as well (not only by pipeline reacting to the destroyed request)
+      // the listeners afterwards): the handler cannot respond while the client is still sending, the body errored
+      // right away as well (not only by the listeners reacting to the destroyed request)
       expect(nodeRequest.destroyed).toBe(true);
       expect(state).toEqual({ body: serverRequest.body, bodyDestroyedOnDestroy: false, bodyDestroyedOnNextTick: true });
 
@@ -833,8 +852,6 @@ describe('node', () => {
     });
 
     test('with body, with request body max bytes, with too large content-length', async () => {
-      await useActualPipeline();
-
       const chunks = { read: 0 };
 
       const nodeRequest = createStreamNodeRequest(
@@ -906,8 +923,6 @@ describe('node', () => {
     );
 
     test('with body, with request body max bytes, with request body timeout, with stalling request', async () => {
-      await useActualPipeline();
-
       const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
@@ -936,10 +951,112 @@ describe('node', () => {
       expect(nodeResponseMocks).toHaveLength(0);
       expectAllMocksCalled(mocks);
     });
+    test('with body, with request body max bytes, without pipeline', async () => {
+      const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
+
+      const nodeRequest = createStreamNodeRequest(Readable.from([Buffer.from('abcd')]));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      expect(await text(serverRequest.body)).toBe('abcd');
+
+      await wait(0);
+
+      // pipeline would abort its internal AbortController, even on success (a DOMException with a stack trace)
+      expect(abortSpy).not.toHaveBeenCalled();
+
+      abortSpy.mockRestore();
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with request closed before it ended', async () => {
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      // destroyed without an error: still not a complete body
+      nodeRequest.destroy();
+
+      await expect(text(serverRequest.body)).rejects.toThrow('Request body has been closed before it ended');
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with failing request, with body not iterated', async () => {
+      const error = new Error('aborted');
+
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      nodeRequest.destroy(error);
+
+      await wait(0);
+
+      // the error of the not iterated body must not surface as an unhandled 'error' event
+      expect((serverRequest.body as Readable).errored).toBe(error);
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with body read after the request ended', async () => {
+      const nodeRequest = createStreamNodeRequest(Readable.from([Buffer.from('ab'), Buffer.from('cd')]));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      // the request ended (and closed) before the handler reads the body: the body is still complete
+      await wait(10);
+
+      expect(nodeRequest.readableEnded).toBe(true);
+      expect(await text(serverRequest.body)).toBe('abcd');
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with body no longer read', async () => {
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
+      nodeRequest.push('ab');
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      // oxlint-disable-next-line no-unreachable-loop
+      for await (const chunk of serverRequest.body) {
+        expect(Buffer.from(chunk).toString()).toBe('ab');
+
+        break;
+      }
+
+      await wait(0);
+
+      // the handler stopped reading the body: the request (and therefore the connection) gets destroyed
+      expect(nodeRequest.destroyed).toBe(true);
+      expect(nodeRequest.errored).toBeNull();
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with request not destroyed on end', async () => {
+      // a request which does not get destroyed once ended: the read body must not destroy it either
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {}, autoDestroy: false }));
+      nodeRequest.push('abcd');
+      nodeRequest.push(null);
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      expect(await text(serverRequest.body)).toBe('abcd');
+
+      await wait(0);
+
+      expect((serverRequest.body as Readable).destroyed).toBe(true);
+      expect(nodeRequest.destroyed).toBe(false);
+
+      expectAllMocksCalled(mocks);
+    });
   });
 
   describe('createResponseToNodeResponseEmitter', () => {
-    test('with body', () => {
+    test('with node stream body', async () => {
       const response = createResponse({
         status: 201,
         reasonPhrase: 'Created',
@@ -950,44 +1067,67 @@ describe('node', () => {
             'ui_lang=en-US; Path=/; Max-Age=31536000; SameSite=Lax',
           ],
         },
+        body: Readable.from([Buffer.from('some'), Buffer.from(' body')], { objectMode: false }),
       });
 
-      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        {
-          name: 'writeHead',
-          callback: createWriteHead(201, 'Created', {
-            'x-custom': ['some-value1', 'some-value2'],
-            'set-cookie': [
-              'sessionId=abc123; Path=/; HttpOnly; Secure; SameSite=Lax',
-              'ui_lang=en-US; Path=/; Max-Age=31536000; SameSite=Lax',
-            ],
-          }),
-        },
-      ]);
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(
+        createWriteHead(201, 'Created', {
+          'x-custom': ['some-value1', 'some-value2'],
+          'set-cookie': [
+            'sessionId=abc123; Path=/; HttpOnly; Secure; SameSite=Lax',
+            'ui_lang=en-US; Path=/; Max-Age=31536000; SameSite=Lax',
+          ],
+        }),
+      );
 
-      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([
-        {
-          callback: (source, destination, callback) => {
-            expect(source).toBe(response.body);
-            expect(destination).toBe(nodeResponse);
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
 
-            // the errors get handled by pipeline itself, the callback only consumes them
-            expect(callback(new Error('write failed'))).toBeUndefined();
-          },
-        },
-      ]);
+      await closed;
 
-      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
+      // the ended body (closed afterwards) must not destroy the response
+      await wait(0);
 
-      const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter();
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
+      expect(nodeResponse.destroyed).toBe(false);
+    });
 
-      responseToNodeResponseEmitter(response, nodeResponse);
+    test('with body, without pipeline', async () => {
+      const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
 
-      expect(nodeResponseMocks).toHaveLength(0);
-      expect(pipelineMocks).toHaveLength(0);
+      const { nodeResponse, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse(), nodeResponse);
+
+      await closed;
+
+      // pipeline would abort its internal AbortController, even on success (a DOMException with a stack trace)
+      expect(abortSpy).not.toHaveBeenCalled();
+
+      abortSpy.mockRestore();
     });
 
     test('with web stream body', async () => {
+      const response = createResponse({
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('some body'));
+            controller.close();
+          },
+        }),
+      });
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
+
+      await closed;
+
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with web stream body, with response closed before it has been sent', async () => {
       const cancelled = Promise.withResolvers<unknown>();
 
       const response = createResponse({
@@ -1002,115 +1142,214 @@ describe('node', () => {
         }),
       });
 
-      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        { name: 'writeHead', callback: createWriteHead(200, 'OK', {}) },
-      ]);
+      const { nodeResponse, chunks } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
 
-      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([
-        {
-          callback: (source) => {
-            // a node stream, which cancels the web stream even while a read is pending
-            expect(source).toBeInstanceOf(Readable);
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
 
-            // pipeline is mocked: nothing else listens to the error of the destroyed source
-            (source as Readable).on('error', () => {}).destroy(new Error('client gone'));
-          },
-        },
-      ]);
+      await wait(10);
 
-      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
+      expect(Buffer.concat(chunks).toString()).toBe('partial');
 
-      const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter();
+      // the client disconnected: the web stream gets cancelled even while a read is pending
+      nodeResponse.destroy();
 
-      responseToNodeResponseEmitter(response, nodeResponse);
+      expect(await cancelled.promise).toBeNull();
+    });
 
-      expect(((await cancelled.promise) as Error).message).toBe('client gone');
+    test('with async generator body', async () => {
+      const response = createResponse({
+        body: (async function* () {
+          yield Buffer.from('some');
+          yield Buffer.from(' body');
+        })(),
+      });
 
-      expect(nodeResponseMocks).toHaveLength(0);
-      expect(pipelineMocks).toHaveLength(0);
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      const piped = new Promise<Readable>((resolve) => nodeResponse.once('pipe', resolve));
+
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
+
+      // not in object mode: the backpressure is based on bytes, not on the number of chunks
+      expect((await piped).readableObjectMode).toBe(false);
+
+      await closed;
+
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with async generator body, with response closed before it has been sent', async () => {
+      const returned = Promise.withResolvers<unknown>();
+      const caught = vi.fn();
+
+      const response = createResponse({
+        body: (async function* () {
+          try {
+            yield Buffer.from('partial');
+            // a further chunk gets requested, but is not ready before the client disconnects
+            await wait(20);
+            yield Buffer.from('never sent');
+          } catch (error) {
+            caught(error);
+          } finally {
+            returned.resolve(undefined);
+          }
+        })(),
+      });
+
+      const { nodeResponse, chunks } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
+
+      await wait(10);
+
+      nodeResponse.destroy();
+
+      await returned.promise;
+
+      // returned, not thrown into: the generator does not see an error
+      expect(caught).not.toHaveBeenCalled();
+      expect(Buffer.concat(chunks).toString()).toBe('partial');
+    });
+
+    test('with failing body', async () => {
+      const error = new Error('upstream failed');
+
+      const body = new Readable({ read() {} });
+      body.push('partial');
+
+      const { nodeResponse, chunks } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await wait(0);
+
+      body.destroy(error);
+
+      await wait(0);
+
+      // the client must not take the truncated body for a complete one
+      expect(Buffer.concat(chunks).toString()).toBe('partial');
+      expect(nodeResponse.destroyed).toBe(true);
+      expect((nodeResponse as unknown as Writable).errored).toBe(error);
+    });
+
+    test('with failing body, without close', async () => {
+      const error = new Error('upstream failed');
+
+      // a body which does not get destroyed on error, therefore never closes
+      const body = new Readable({ read() {}, autoDestroy: false });
+
+      const { nodeResponse } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      body.emit('error', error);
+
+      await wait(0);
+
+      // the error itself destroys the response (and not a close of the body)
+      expect(nodeResponse.destroyed).toBe(true);
+      expect((nodeResponse as unknown as Writable).errored).toBe(error);
+    });
+
+    test('with body closed before it ended', async () => {
+      const body = new Readable({ read() {} });
+      body.push('partial');
+
+      const { nodeResponse } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await wait(0);
+
+      // destroyed without an error: still not a complete body
+      body.destroy();
+
+      await wait(0);
+
+      expect(nodeResponse.destroyed).toBe(true);
+      expect((nodeResponse as unknown as Writable).errored?.message).toBe(
+        'Response body has been closed before it ended',
+      );
+    });
+
+    test('with response closed before it has been sent', async () => {
+      const body = new Readable({ read() {} });
+      body.push('partial');
+
+      const { nodeResponse } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await wait(0);
+
+      // the client disconnected
+      nodeResponse.destroy();
+
+      await wait(0);
+
+      // destroyed without an error: nothing went wrong with the body itself
+      expect(body.destroyed).toBe(true);
+      expect(body.errored).toBeNull();
+    });
+
+    test('with response sent, with body not destroyed on end', async () => {
+      // a body which does not get destroyed once ended: the sent response must not destroy it either
+      const body = new Readable({ read() {}, autoDestroy: false });
+      body.push('some body');
+      body.push(null);
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(body.destroyed).toBe(false);
     });
 
     test('with body, with response send timeout, with stalling response', async () => {
-      const response = createResponse();
+      // stays open: never ends
+      const body = new Readable({ read() {} });
 
-      const destroyed = Promise.withResolvers<Error>();
-
-      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        { name: 'writeHead', callback: createWriteHead(200, 'OK', {}) },
-        {
-          name: 'on',
-          callback: ((event: string) => {
-            expect(event).toBe('close');
-
-            return nodeResponse;
-          }) as ServerResponse['on'],
-        },
-        {
-          name: 'destroy',
-          callback: (error?: Error): ServerResponse => {
-            destroyed.resolve(error as Error);
-
-            return nodeResponse;
-          },
-        },
-      ]);
-
-      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([{ callback: () => undefined }]);
-
-      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
+      const { nodeResponse, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
 
       const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter(50);
 
       const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
 
-      responseToNodeResponseEmitter(response, nodeResponse);
+      responseToNodeResponseEmitter(createResponse({ body }), nodeResponse);
 
       // the timeout must not keep the process alive
       expect((setTimeoutSpy.mock.results[0].value as NodeJS.Timeout).hasRef()).toBe(false);
 
       setTimeoutSpy.mockRestore();
 
-      expect((await destroyed.promise).message).toBe('Response has not been fully sent within 50ms');
+      await closed;
 
-      expect(nodeResponseMocks).toHaveLength(0);
-      expect(pipelineMocks).toHaveLength(0);
+      expect((nodeResponse as unknown as Writable).errored?.message).toBe(
+        'Response has not been fully sent within 50ms',
+      );
+
+      // the stalling body gets stopped as well
+      expect(body.destroyed).toBe(true);
     });
 
     test('with body, with response send timeout, with response sent in time', async () => {
-      const response = createResponse();
+      const { nodeResponse, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
 
-      const closeListeners: Array<Listener> = [];
+      createResponseToNodeResponseEmitter(50)(createResponse(), nodeResponse);
 
-      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        { name: 'writeHead', callback: createWriteHead(200, 'OK', {}) },
-        {
-          name: 'on',
-          callback: ((event: string, listener: Listener) => {
-            expect(event).toBe('close');
+      await closed;
 
-            closeListeners.push(listener);
-
-            return nodeResponse;
-          }) as ServerResponse['on'],
-        },
-      ]);
-
-      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([{ callback: () => undefined }]);
-
-      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
-
-      const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter(50);
-
-      responseToNodeResponseEmitter(response, nodeResponse);
-
-      // the response has been fully sent: the timeout gets cleared and must not destroy the response (a destroy call
-      // would fail with a missing mock)
-      closeListeners.forEach((listener) => listener());
-
+      // the response has been fully sent: the timeout gets cleared and must not destroy the response
       await wait(100);
 
-      expect(nodeResponseMocks).toHaveLength(0);
-      expect(pipelineMocks).toHaveLength(0);
+      expect(nodeResponse.writableFinished).toBe(true);
+      expect(nodeResponse.destroyed).toBe(false);
     });
 
     test('with already destroyed body', () => {
@@ -1118,8 +1357,7 @@ describe('node', () => {
       body.on('error', () => {});
       body.destroy(new Error('upstream failed'));
 
-      // nothing gets written to the response (a call would fail with a missing mock), nothing gets piped (a call would
-      // fail with a missing pipeline)
+      // nothing gets written to the response (a call would fail with a missing mock)
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([]);
 
       const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter();
@@ -1140,29 +1378,16 @@ describe('node', () => {
       expect(body.destroyed).toBe(true);
       expect(body.readableEnded).toBe(true);
 
-      const response = createResponse({ body });
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
 
-      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        { name: 'writeHead', callback: createWriteHead(200, 'OK', {}) },
-      ]);
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
 
-      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([
-        {
-          callback: (source, destination) => {
-            expect(source).toBe(body);
-            expect(destination).toBe(nodeResponse);
-          },
-        },
-      ]);
+      await closed;
 
-      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
-
-      createResponseToNodeResponseEmitter()(response, nodeResponse);
-
-      expect(nodeResponseMocks).toHaveLength(0);
-      expect(pipelineMocks).toHaveLength(0);
+      expect(chunks).toHaveLength(0);
+      expect(nodeResponse.writableFinished).toBe(true);
+      expect(nodeResponse.destroyed).toBe(false);
     });
-
     test('with node stream body, with writeHead error', () => {
       const error = new TypeError('Invalid character in header content ["x-custom"]');
 

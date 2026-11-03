@@ -1,7 +1,7 @@
 {
   "name": "@chubbyts/chubbyts-http-node",
   "type": "module",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Use @chubbyts/chubbyts-http-types on node.js",
   "keywords": [
     "chubbyts",

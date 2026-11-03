@@ -1,5 +1,5 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
-import { Readable, Transform, pipeline } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { Body, Headers, Response, ServerRequest } from '@chubbyts/chubbyts-http-types/message';
 import type { ServerRequestFactory, UriFactory } from '@chubbyts/chubbyts-http-types/message-factory';
@@ -118,8 +118,8 @@ const limitBody = (
       if (received.bytes > requestBodyMaxBytes) {
         const error = createError();
 
-        // both sides get destroyed right away (an errored transform callback and pipeline would defer it to the next
-        // ticks): the connection gets closed before the handler, getting the error while iterating the body, could
+        // both sides get destroyed right away (an errored transform callback and the close listeners would defer it
+        // to the next ticks): the connection gets closed before the handler, getting the error while iterating the body, could
         // respond while the client is still sending
         nodeRequest.destroy(error);
         limitedBody.destroy(error);
@@ -131,12 +131,30 @@ const limitBody = (
     },
   });
 
-  // pipeline destroys both sides on failure: an exceeded limit destroys the request, a destroyed request (client
-  // abort, request body timeout) the limited body, the callback only consumes the error (pipeline keeps listening
-  // for errors: no unhandled 'error' event, iterating the body still rejects with the error)
-  pipeline(nodeRequest, limitedBody, () => {});
+  // piped instead of using pipeline (see sendBody), the failures get propagated by hand: a destroyed request (client
+  // abort, request body timeout) destroys the limited body, the error reaches the handler while iterating the body
+  nodeRequest.on('error', (error) => limitedBody.destroy(error));
+  nodeRequest.on('close', () => {
+    if (!nodeRequest.readableEnded) {
+      limitedBody.destroy(new Error('Request body has been closed before it ended'));
+    }
+  });
 
-  // a declared too large body gets rejected before reading it (pipeline starts reading on the next tick), the body is
+  // a limited body no longer read (the handler stopped iterating it) stops receiving the request, the client would
+  // otherwise keep on sending the body
+  limitedBody.on('close', () => {
+    if (!nodeRequest.readableEnded) {
+      nodeRequest.destroy();
+    }
+  });
+
+  // no unhandled 'error' event for a body nobody iterates, iterating the body still rejects with the error
+  limitedBody.on('error', () => {});
+
+  // pipe handles the backpressure and ends the limited body once the request ended
+  nodeRequest.pipe(limitedBody);
+
+  // a declared too large body gets rejected before reading it (pipe starts reading on the next tick), the body is
   // the limited body as well: the same type, regardless of how the limit got exceeded
   if (Number(contentLength) > requestBodyMaxBytes) {
     const error = createError();
@@ -241,6 +259,47 @@ const cancelBody = (body: Body): void => {
   }
 };
 
+const toReadable = (body: Body): Readable => {
+  if (body instanceof Readable) {
+    return body;
+  }
+
+  // a web stream gets converted with fromWeb: iterating it, a pending read blocks the return of its async iterator and
+  // the stream would not get cancelled on failure
+  if (body instanceof ReadableStream) {
+    return Readable.fromWeb(body as NodeReadableStream);
+  }
+
+  // not in object mode: the chunks of a body have to be bytes
+  return Readable.from(body, { objectMode: false });
+};
+
+// piped instead of using pipeline: pipeline creates an AbortController per call and aborts it once done, even on
+// success, the abort reason is a DOMException capturing a stack trace (about 3µs per response, which nobody reads)
+const sendBody = (body: Readable, nodeResponse: ServerResponse): void => {
+  // a failing response (e.g. a write after it got destroyed) must not surface as an unhandled 'error' event
+  nodeResponse.on('error', () => {});
+
+  // a failing body destroys the response: the client must not take a truncated body for a complete one
+  body.on('error', (error) => nodeResponse.destroy(error));
+  body.on('close', () => {
+    if (!body.readableEnded) {
+      nodeResponse.destroy(new Error('Response body has been closed before it ended'));
+    }
+  });
+
+  // a response closed before it has been fully sent (client disconnected, response send timeout) stops the body,
+  // destroyed without an error: an async iterator gets returned (not thrown into), a web stream cancelled
+  nodeResponse.on('close', () => {
+    if (!nodeResponse.writableFinished) {
+      body.destroy();
+    }
+  });
+
+  // pipe handles the backpressure and ends the response once the body ended (also when it already did)
+  body.pipe(nodeResponse);
+};
+
 type ResponseToNodeResponseEmitter = (response: Response, nodeResponse: ServerResponse) => void;
 
 export const createResponseToNodeResponseEmitter = (
@@ -275,13 +334,6 @@ export const createResponseToNodeResponseEmitter = (
       nodeResponse.on('close', () => clearTimeout(timeout));
     }
 
-    // pipeline destroys both sides itself on failure (a failing nodeResponse stops the body
-    // iteration, a failing body destroys nodeResponse): the callback only consumes the error
-    // a web stream gets converted: pipeline would iterate it, a pending read blocks the return of its async iterator
-    // and the stream would not get cancelled on failure
-    const body =
-      response.body instanceof ReadableStream ? Readable.fromWeb(response.body as NodeReadableStream) : response.body;
-
-    pipeline(body, nodeResponse, () => {});
+    sendBody(toReadable(response.body), nodeResponse);
   };
 };
