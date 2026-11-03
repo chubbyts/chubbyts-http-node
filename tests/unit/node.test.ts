@@ -1113,6 +1113,56 @@ describe('node', () => {
       expect(pipelineMocks).toHaveLength(0);
     });
 
+    test('with already destroyed body', () => {
+      const body = new Readable({ read() {} });
+      body.on('error', () => {});
+      body.destroy(new Error('upstream failed'));
+
+      // nothing gets written to the response (a call would fail with a missing mock), nothing gets piped (a call would
+      // fail with a missing pipeline)
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([]);
+
+      const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter();
+
+      expect(() => responseToNodeResponseEmitter(createResponse({ body }), nodeResponse)).toThrow(
+        'Response body has already been destroyed',
+      );
+
+      expect(nodeResponseMocks).toHaveLength(0);
+    });
+
+    test('with already ended body', async () => {
+      const body = Readable.from([]);
+      body.resume();
+      await new Promise((resolve) => body.once('close', resolve));
+
+      // an ended body gets destroyed as well (autoDestroy): it still gets sent
+      expect(body.destroyed).toBe(true);
+      expect(body.readableEnded).toBe(true);
+
+      const response = createResponse({ body });
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'writeHead', callback: createWriteHead(200, 'OK', {}) },
+      ]);
+
+      const [pipeline, pipelineMocks] = useFunctionMock<Pipeline>([
+        {
+          callback: (source, destination) => {
+            expect(source).toBe(body);
+            expect(destination).toBe(nodeResponse);
+          },
+        },
+      ]);
+
+      pipelineHolder.pipeline = pipeline as (...args: Array<unknown>) => unknown;
+
+      createResponseToNodeResponseEmitter()(response, nodeResponse);
+
+      expect(nodeResponseMocks).toHaveLength(0);
+      expect(pipelineMocks).toHaveLength(0);
+    });
+
     test('with node stream body, with writeHead error', () => {
       const error = new TypeError('Invalid character in header content ["x-custom"]');
 

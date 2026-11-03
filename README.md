@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-node][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-node@^1.1.0
+npm i @chubbyts/chubbyts-http-node@^1.1.1
 ```
 
 ## Usage
@@ -136,6 +136,9 @@ The server request gets created by `serverRequestFactory(method, uriFactory(url)
 The body gets piped into the `ServerResponse`. A node stream body is used as is and a web stream body gets converted
 with `Readable.fromWeb`, so both get stopped (destroyed / cancelled) when the client disconnects, even while a read is
 pending. Any other `AsyncIterable` can only be stopped once its pending chunk arrives.
+
+An already destroyed (e.g. errored) node stream body lets the emitter throw before anything has been written, so the
+caller is still able to respond with an error (piping it would destroy the connection).
 
 ### Limits and timeouts
 

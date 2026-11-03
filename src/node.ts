@@ -247,6 +247,12 @@ export const createResponseToNodeResponseEmitter = (
   responseSendTimeoutMs: number | undefined = undefined,
 ): ResponseToNodeResponseEmitter => {
   return (response: Response, nodeResponse: ServerResponse): void => {
+    // a destroyed (e.g. errored) body cannot be sent anymore, piping it would destroy the connection: thrown before
+    // anything has been written, the caller is still able to send an error response
+    if (response.body instanceof Readable && response.body.destroyed && !response.body.readableEnded) {
+      throw new Error('Response body has already been destroyed');
+    }
+
     // node rejects control characters within header values and a status outside 100-999:
     // writeHead can therefore throw for a constructed Response; cancel the potentially
     // connection-backed body before surfacing the error, nothing has been sent to the client yet
