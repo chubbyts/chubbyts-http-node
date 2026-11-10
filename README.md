@@ -30,14 +30,14 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 ## Requirements
 
  * node: 22
- * [@chubbyts/chubbyts-http-types][2]: ^4.0.0
+ * [@chubbyts/chubbyts-http-types][2]: ^4.3.0
 
 ## Installation
 
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-node][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-node@^1.1.2
+npm i @chubbyts/chubbyts-http-node@^1.1.3
 ```
 
 ## Usage
@@ -118,7 +118,8 @@ process.on('SIGTERM', () => shutdownServer(server));
 ### Server request
 
 The server request gets created by `serverRequestFactory(method, uriFactory(url))`, then `withProtocolVersion`,
-`withSignal`, `withHeader` (for each header) and, except for `GET` and `HEAD`, `withBody` get applied:
+`withSignal`, `withHeaders` (all headers at once, if the helpers do not implement it: `withHeader` for each header) and,
+except for `GET` and `HEAD`, `withBody` get applied:
 
  * the url gets built from the base url (scheme, host, port and path prefix) and the origin-form request target, without
    a base url from the local address and port of the socket. Request targets in another form get rejected.

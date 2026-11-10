@@ -8,6 +8,8 @@ import type { RequestHelpers } from '@chubbyts/chubbyts-http-types/message-helpe
 const defaultHttpPort = 80;
 const defaultHttpsPort = 443;
 
+const noop = (): void => {};
+
 // credentials are singleton fields (RFC 9110 5.5): duplicates cannot be combined, a middleware
 // joining the values with ', ' (getHeaderLine) would confuse downstream auth parsing
 const singletonHeaderNames = new Set(['authorization', 'proxy-authorization']);
@@ -48,23 +50,53 @@ const nodeRequestToHeaders = (nodeRequest: IncomingMessage): Map<string, Array<s
   return headers;
 };
 
-const headersToNodeHeaders = (headers: Headers): OutgoingHttpHeaders =>
-  // node sends every value of an array as its own header line, which is required for set-cookie (RFC 6265 3)
-  Object.fromEntries(Object.entries(headers).map(([name, values]) => [name, [...values]]));
+const headersToNodeHeaders = (headers: Headers): OutgoingHttpHeaders => {
+  // without a prototype: a header named '__proto__' is a header like any other
+  const nodeHeaders: Record<string, Array<string>> = Object.create(null);
+
+  for (const name of Object.keys(headers)) {
+    // node sends every value of an array as its own header line, which is required for set-cookie (RFC 6265 3)
+    // oxlint-disable-next-line functional/immutable-data
+    nodeHeaders[name] = [...headers[name]];
+  }
+
+  return nodeHeaders;
+};
+
+// the base url is the same for (nearly) every request: the given one, or the local address of the socket, its parsed
+// parts get reused as long as it does not change (a single entry: nothing a client could grow)
+const resolvedBases: { last?: { readonly base: string; readonly origin: string; readonly pathPrefix: string } } = {};
+
+const resolveBase = (base: string): { readonly origin: string; readonly pathPrefix: string } => {
+  const { last } = resolvedBases;
+
+  // Stryker disable next-line ConditionalExpression,BlockStatement: parsing it again results in the same, only slower
+  if (last?.base === base) {
+    return last;
+  }
+
+  const parsedBase = new URL(base);
+  const resolvedBase = { base, origin: parsedBase.origin, pathPrefix: parsedBase.pathname.replace(/\/$/, '') };
+
+  // oxlint-disable-next-line functional/immutable-data
+  resolvedBases.last = resolvedBase;
+
+  return resolvedBase;
+};
 
 const resolveUrl = (path: string, base: string): string => {
-  const parsedBase = new URL(base);
-  const url = new URL(parsedBase.pathname.replace(/\/$/, '') + path, parsedBase.origin);
+  const { origin, pathPrefix } = resolveBase(base);
+  const url = new URL(pathPrefix + path, origin);
 
   // protocol-relative ('//evil.com/path') and backslash ('/\evil.com/path') targets resolve
   // to a different host than the base url and must not be trusted
-  if (url.origin !== parsedBase.origin) {
+  if (url.origin !== origin) {
     throw new Error(
-      `Request target "${path}" resolves to origin "${url.origin}" instead of the expected origin "${parsedBase.origin}"`,
+      `Request target "${path}" resolves to origin "${url.origin}" instead of the expected origin "${origin}"`,
     );
   }
 
-  return url.toString();
+  return url.href;
 };
 
 export const getUrl = (nodeRequest: IncomingMessage, baseUrl: string | undefined = undefined): string => {
@@ -149,7 +181,7 @@ const limitBody = (
   });
 
   // no unhandled 'error' event for a body nobody iterates, iterating the body still rejects with the error
-  limitedBody.on('error', () => {});
+  limitedBody.on('error', noop);
 
   // pipe handles the backpressure and ends the limited body once the request ended
   nodeRequest.pipe(limitedBody);
@@ -210,10 +242,18 @@ export const createNodeRequestToServerRequestFactory = (
       getProtocolVersion(nodeRequest),
     );
 
-    const serverRequest = [...headers].reduce(
-      (request, [name, values]) => requestHelpers.withHeader(request, name, values),
-      requestHelpers.withSignal(createdServerRequest, abortController.signal),
-    );
+    const serverRequestWithSignal = requestHelpers.withSignal(createdServerRequest, abortController.signal);
+
+    // withHeaders copies the request only once, withHeader once per header: optional for the implementations of 4.x
+    const { withHeaders } = requestHelpers;
+
+    // Object.fromEntries defines the names as own properties: a header named '__proto__' does not change the prototype
+    const serverRequest = withHeaders
+      ? (withHeaders.call(requestHelpers, serverRequestWithSignal, Object.fromEntries(headers)) as ServerRequest)
+      : [...headers].reduce(
+          (request, [name, values]) => requestHelpers.withHeader(request, name, values),
+          serverRequestWithSignal,
+        );
 
     // the body of a GET or HEAD request gets ignored: the server request keeps the (empty) body of the factory
     if (method === 'GET' || method === 'HEAD') {
@@ -222,7 +262,7 @@ export const createNodeRequestToServerRequestFactory = (
 
     // a client abort / socket error must not surface as an unhandled 'error' event;
     // iterating the body still rejects with the error
-    nodeRequest.on('error', () => {});
+    nodeRequest.on('error', noop);
 
     // slowloris protection: a client sending the body arbitrarily slow would otherwise keep the
     // request (and its socket) alive forever, the error reaches the handler while iterating the body
@@ -278,7 +318,7 @@ const toReadable = (body: Body): Readable => {
 // success, the abort reason is a DOMException capturing a stack trace (about 3µs per response, which nobody reads)
 const sendBody = (body: Readable, nodeResponse: ServerResponse): void => {
   // a failing response (e.g. a write after it got destroyed) must not surface as an unhandled 'error' event
-  nodeResponse.on('error', () => {});
+  nodeResponse.on('error', noop);
 
   // a failing body destroys the response: the client must not take a truncated body for a complete one
   body.on('error', (error) => nodeResponse.destroy(error));
