@@ -1337,7 +1337,7 @@ describe('node', () => {
 
       const nodeHeaders = writeHead.mock.calls[0][2];
 
-      expect(Object.getPrototypeOf(nodeHeaders)).toBe(null);
+      expect(Object.getPrototypeOf(nodeHeaders)).toBeNull();
       expect(Object.entries(nodeHeaders)).toEqual([
         ['x-custom', ['value1', 'value2']],
         ['__proto__', ['value3']],
