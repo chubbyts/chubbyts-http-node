@@ -88,6 +88,8 @@ const useImplementationMocks = (
         method: string;
         protocolVersion: string;
         headers?: Array<[string, Array<string>]>;
+        // without the optional withHeaders: falls back to withHeader for each header
+        withoutWithHeaders?: boolean;
         withBody?: boolean;
       }
     | undefined = undefined,
@@ -127,15 +129,37 @@ const useImplementationMocks = (
             },
           },
           { name: 'withSignal', callback: (request, signal) => ({ ...request, signal }) },
-          ...(expected.headers ?? []).map(([expectedName, expectedValues]): ObjectMocks<RequestHelpers>[number] => ({
-            name: 'withHeader',
-            callback: (message, name, value) => {
-              expect(name).toBe(expectedName);
-              expect(value).toEqual(expectedValues);
+          ...(expected.withoutWithHeaders
+            ? [
+                { name: 'withHeaders', value: undefined } satisfies ObjectMocks<RequestHelpers>[number],
+                ...(expected.headers ?? []).map(
+                  ([expectedName, expectedValues]): ObjectMocks<RequestHelpers>[number] => ({
+                    name: 'withHeader',
+                    callback: (message, name, value) => {
+                      expect(name).toBe(expectedName);
+                      expect(value).toEqual(expectedValues);
 
-              return { ...message, headers: { ...message.headers, [name]: value as ReadonlyArray<string> } };
-            },
-          })),
+                      return { ...message, headers: { ...message.headers, [name]: value as ReadonlyArray<string> } };
+                    },
+                  }),
+                ),
+              ]
+            : [
+                {
+                  name: 'withHeaders',
+                  // called as a method of the helpers, with all headers at once (own properties of a plain object)
+                  value: function (this: unknown, message, headers) {
+                    expect(Object.is(this, requestHelpers)).toBe(true);
+                    expect(Object.getPrototypeOf(headers)).toBe(Object.prototype);
+                    expect(Object.entries(headers)).toEqual(expected.headers ?? []);
+
+                    return {
+                      ...message,
+                      headers: Object.fromEntries([...Object.entries(message.headers), ...Object.entries(headers)]),
+                    } as typeof message;
+                  },
+                } satisfies ObjectMocks<RequestHelpers>[number],
+              ]),
           ...(expected.withBody
             ? [
                 {
@@ -196,6 +220,12 @@ const createLimitedServerRequest = (nodeRequest: IncomingMessage) => {
   return { serverRequest, mocks: [nodeResponseMocks, ...mocks] };
 };
 
+const getUrlWithBaseUrl = (baseUrl: string) => {
+  const [nodeRequest] = useObjectMock<IncomingMessage>([{ name: 'url', value: '/a' }]);
+
+  return getUrl(nodeRequest, baseUrl);
+};
+
 describe('node', () => {
   describe('getUrl', () => {
     test('with base url', () => {
@@ -249,6 +279,13 @@ describe('node', () => {
         '/\\evil.com/path/to/route',
         'Request target "/\\evil.com/path/to/route" resolves to origin "https://evil.com" instead of the expected origin "https://example.com"',
       ],
+      // tab, line feed and carriage return get removed by the url parser: the third character becomes the second
+      ...['\t', '\n', '\r'].flatMap((removed) =>
+        ['/', '\\'].map((separator): [string, string] => [
+          `/${removed}${separator}evil.com/path/to/route`,
+          `Request target "/${removed}${separator}evil.com/path/to/route" resolves to origin "https://evil.com" instead of the expected origin "https://example.com"`,
+        ]),
+      ),
       [
         'http://evil.com/path/to/route',
         'Unsupported request target "http://evil.com/path/to/route": only origin-form (starting with "/") is supported',
@@ -261,6 +298,66 @@ describe('node', () => {
       expect(() => getUrl(nodeRequest, 'https://example.com')).toThrow(expected);
 
       expect(nodeRequestMocks).toHaveLength(0);
+    });
+  });
+
+  describe('getUrl, resolved like a relative reference against the origin of the base url', () => {
+    test.each([
+      ['https://example.com', '/', 'https://example.com/'],
+      ['https://example.com', '/?key=value#fragment', 'https://example.com/?key=value#fragment'],
+      ['https://example.com', '/a/./b/../c/%2e%2e/d e', 'https://example.com/a/d%20e'],
+      ['https://example.com', '/a\\b\tc', 'https://example.com/a/bc'],
+      ['https://example.com:443/app/', '/a//b', 'https://example.com/app/a//b'],
+      ['http://example.com:8080/app', '/../../a', 'http://example.com:8080/a'],
+      ['https://user:password@example.com/app', '/a', 'https://example.com/app/a'],
+      // the authority of the target is the one of the base url, with the user info of the target
+      ['https://example.com', '//user@example.com/a', 'https://user@example.com/a'],
+      // the path of a blob url is its inner url, which does not start with a '/'
+      ['blob:https://example.com/uuid', '/a', 'https://example.com/uuid/a'],
+    ])('with base url "%s", with request target "%s"', (baseUrl, url, expected) => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([{ name: 'url', value: url }]);
+
+      expect(getUrl(nodeRequest, baseUrl)).toBe(expected);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+    });
+
+    test.each([
+      ['https://example.com//evil.com', '/a', 'resolves to origin "https://evil.com"'],
+      ['file:///some/path', '/a', 'Invalid URL'],
+      ['foo://example.com/app', '/a', 'Invalid URL'],
+      ['not-a-url', '/a', 'Invalid URL'],
+    ])('with base url "%s", with request target "%s", fails', (baseUrl, url, expected) => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([{ name: 'url', value: url }]);
+
+      expect(() => getUrl(nodeRequest, baseUrl)).toThrow(expected);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+    });
+
+    test('with base url with an opaque origin, fails like resolving against it', () => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([{ name: 'url', value: '/a' }]);
+
+      try {
+        getUrl(nodeRequest, 'file:///some/path');
+
+        throw new Error('Expected an invalid url');
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'ERR_INVALID_URL', input: '/some/path/a', base: 'null' });
+      }
+
+      expect(nodeRequestMocks).toHaveLength(0);
+    });
+
+    test('with changing base urls', () => {
+      expect(getUrlWithBaseUrl('https://example.com/one')).toBe('https://example.com/one/a');
+      expect(getUrlWithBaseUrl('https://example.org/two/')).toBe('https://example.org/two/a');
+      expect(getUrlWithBaseUrl('https://example.org/two/')).toBe('https://example.org/two/a');
+      expect(getUrlWithBaseUrl('https://example.com/one')).toBe('https://example.com/one/a');
+
+      // a failing base url must not replace (parts of) the last one
+      expect(() => getUrlWithBaseUrl('not-a-url')).toThrow('Invalid URL');
+      expect(getUrlWithBaseUrl('https://example.com/one')).toBe('https://example.com/one/a');
     });
   });
 
@@ -408,6 +505,131 @@ describe('node', () => {
       expect(nodeResponseMocks).toHaveLength(0);
       expectAllMocksCalled(mocks);
     });
+
+    test('with method, with base url, without withHeaders', () => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'method', value: 'HEAD' },
+        {
+          name: 'rawHeaders',
+          value: [
+            'Content-Type',
+            'text/plain',
+            'x-custom',
+            'value1',
+            'X-Custom',
+            'value2',
+            'Cookie',
+            'sessionId=abc123',
+            'Cookie',
+            'ui_lang=en-US',
+            'Authorization',
+            'Bearer token1',
+          ],
+        },
+        { name: 'url', value: '/path/to/route' },
+        { name: 'httpVersion', value: '1.0' },
+      ]);
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      // grouped by the lowercased name, in the order of the first occurrence
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'HEAD',
+        protocolVersion: '1.0',
+        withoutWithHeaders: true,
+        headers: [
+          ['content-type', ['text/plain']],
+          ['x-custom', ['value1', 'value2']],
+          ['cookie', ['sessionId=abc123', 'ui_lang=en-US']],
+          ['authorization', ['Bearer token1']],
+        ],
+      });
+
+      const nodeRequestToServerRequestFactory = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+      );
+
+      const serverRequest = nodeRequestToServerRequestFactory(nodeRequest, nodeResponse);
+
+      expect(serverRequest.method).toBe('HEAD');
+      expect(serverRequest.protocolVersion).toBe('1.0');
+      expect(serverRequest.headers).toMatchInlineSnapshot(`
+        {
+          "authorization": [
+            "Bearer token1",
+          ],
+          "content-type": [
+            "text/plain",
+          ],
+          "cookie": [
+            "sessionId=abc123",
+            "ui_lang=en-US",
+          ],
+          "x-custom": [
+            "value1",
+            "value2",
+          ],
+        }
+      `);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test.each([false, true])(
+      'with headers named like object prototype properties, without withHeaders: %s',
+      (withoutWithHeaders) => {
+        const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+          { name: 'method', value: 'GET' },
+          {
+            name: 'rawHeaders',
+            value: ['__proto__', 'value1', 'Constructor', 'value2', '__Proto__', 'value3', 'constructor', 'value4'],
+          },
+          { name: 'url', value: '/' },
+          { name: 'httpVersion', value: '1.1' },
+        ]);
+
+        const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+          { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+        ]);
+
+        // own properties: neither the prototype gets changed, nor a property of it taken for a header
+        const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+          url: 'https://example.com/',
+          method: 'GET',
+          protocolVersion: '1.1',
+          withoutWithHeaders,
+          headers: [
+            ['__proto__', ['value1', 'value3']],
+            ['constructor', ['value2', 'value4']],
+          ],
+        });
+
+        const serverRequest = createNodeRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          'https://example.com',
+        )(nodeRequest, nodeResponse);
+
+        expect(Object.getPrototypeOf(serverRequest.headers)).toBe(Object.prototype);
+        expect(Object.entries(serverRequest.headers)).toEqual([
+          ['__proto__', ['value1', 'value3']],
+          ['constructor', ['value2', 'value4']],
+        ]);
+
+        expect(nodeRequestMocks).toHaveLength(0);
+        expect(nodeResponseMocks).toHaveLength(0);
+        expectAllMocksCalled(mocks);
+      },
+    );
 
     test('with http/2', () => {
       const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
@@ -1090,6 +1312,46 @@ describe('node', () => {
       expect(Buffer.concat(chunks).toString()).toBe('some body');
       expect(nodeResponse.writableFinished).toBe(true);
       expect(nodeResponse.destroyed).toBe(false);
+    });
+
+    test('with headers, copied and defined as own properties', async () => {
+      const values = Object.freeze(['value1', 'value2']);
+      const protoValues = ['value3'];
+
+      // a non-array iterable is no valid header value, but got sent before as well
+      const iterableValues = new Set(['value4']) as unknown as ReadonlyArray<string>;
+
+      const headers = Object.fromEntries([
+        ['x-custom', values],
+        ['__proto__', protoValues],
+        ['x-iterable', iterableValues],
+      ]);
+
+      const writeHead = vi.fn((_statusCode: number, _reasonPhrase: string, _headers: OutgoingHttpHeaders) => undefined);
+
+      const { nodeResponse, closed } = createStreamNodeResponse(writeHead as unknown as ServerResponse['writeHead']);
+
+      createResponseToNodeResponseEmitter()(createResponse({ headers }), nodeResponse);
+
+      await closed;
+
+      const nodeHeaders = writeHead.mock.calls[0][2];
+
+      expect(Object.getPrototypeOf(nodeHeaders)).toBe(null);
+      expect(Object.entries(nodeHeaders)).toEqual([
+        ['x-custom', ['value1', 'value2']],
+        ['__proto__', ['value3']],
+        ['x-iterable', ['value4']],
+      ]);
+
+      // node keeps the given arrays: the ones of the response must not be changeable through them
+      expect(nodeHeaders['x-custom']).not.toBe(values);
+      expect(Object.getOwnPropertyDescriptor(nodeHeaders, '__proto__')?.value).not.toBe(protoValues);
+      expect(Object.getOwnPropertyDescriptor(nodeHeaders, '__proto__')).toMatchObject({
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     });
 
     test('with body, without pipeline', async () => {
