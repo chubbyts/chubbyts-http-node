@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-node][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-node@^1.1.3
+npm i @chubbyts/chubbyts-http-node@^1.1.4
 ```
 
 ## Usage
@@ -128,18 +128,18 @@ except for `GET` and `HEAD`, `withBody` get applied:
    skipped.
  * `protocolVersion` is the http version of node, `2.0` becomes `2`.
  * `body` is the `IncomingMessage` itself (an `AsyncIterable<Buffer>`), with a request body max bytes limit a
-   `Transform` piped from it, `GET` and `HEAD` keep the (empty) body of the factory.
+   `Readable` fed by it (with backpressure), `GET` and `HEAD` keep the (empty) body of the factory.
  * `signal` gets aborted when the `ServerResponse` gets closed before it has been fully sent (client disconnected,
    response destroyed), which is why the factory takes the `ServerResponse` as well.
 
 ### Response
 
-The body gets piped into the `ServerResponse`. A node stream body is used as is and a web stream body gets converted
+The body gets written into the `ServerResponse` (with backpressure). A node stream body is used as is and a web stream body gets converted
 with `Readable.fromWeb`, so both get stopped (destroyed / cancelled) when the client disconnects, even while a read is
 pending. Any other `AsyncIterable` can only be stopped once its pending chunk arrives.
 
 An already destroyed (e.g. errored) node stream body lets the emitter throw before anything has been written, so the
-caller is still able to respond with an error (piping it would destroy the connection).
+caller is still able to respond with an error (sending it would destroy the connection).
 
 ### Limits and timeouts
 

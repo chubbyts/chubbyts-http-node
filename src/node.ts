@@ -1,5 +1,5 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
-import { Readable, Transform } from 'node:stream';
+import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import type { Body, Headers, Response, ServerRequest } from '@chubbyts/chubbyts-http-types/message';
 import type { ServerRequestFactory, UriFactory } from '@chubbyts/chubbyts-http-types/message-factory';
@@ -141,30 +141,43 @@ const limitBody = (
 
   const received = { bytes: 0 };
 
-  // a chunked body (or one with a wrong content-length) gets limited while reading it
-  const limitedBody = new Transform({
-    transform: (chunk: Buffer, _encoding, callback) => {
-      // oxlint-disable-next-line functional/immutable-data
-      received.bytes += chunk.length;
-
-      if (received.bytes > requestBodyMaxBytes) {
-        const error = createError();
-
-        // both sides get destroyed right away (an errored transform callback and the close listeners would defer it
-        // to the next ticks): the connection gets closed before the handler, getting the error while iterating the body, could
-        // respond while the client is still sending
-        nodeRequest.destroy(error);
-        limitedBody.destroy(error);
-
-        return;
-      }
-
-      callback(null, chunk);
+  // a readable fed by the request instead of a transform piped from it: a transform is a readable and a writable, pipe
+  // adds and removes half a dozen listeners per request. Reading the limited body resumes the paused request.
+  const limitedBody = new Readable({
+    read: () => {
+      nodeRequest.resume();
     },
   });
 
-  // piped instead of using pipeline (see sendBody), the failures get propagated by hand: a destroyed request (client
-  // abort, request body timeout) destroys the limited body, the error reaches the handler while iterating the body
+  // a chunked body (or one with a wrong content-length) gets limited while reading it
+  nodeRequest.on('data', (chunk: Buffer) => {
+    // oxlint-disable-next-line functional/immutable-data
+    received.bytes += chunk.length;
+
+    if (received.bytes > requestBodyMaxBytes) {
+      const error = createError();
+
+      // both sides get destroyed right away (the close listeners would defer it to the next ticks): the connection
+      // gets closed before the handler, getting the error while iterating the body, could respond while the client is
+      // still sending
+      nodeRequest.destroy(error);
+      limitedBody.destroy(error);
+
+      return;
+    }
+
+    // backpressure: a limited body not read fast enough pauses the request until it gets read
+    // oxlint-disable-next-line functional/immutable-data
+    if (!limitedBody.push(chunk)) {
+      nodeRequest.pause();
+    }
+  });
+
+  // oxlint-disable-next-line functional/immutable-data
+  nodeRequest.on('end', () => limitedBody.push(null));
+
+  // the failures get propagated by hand: a destroyed request (client abort, request body timeout) destroys the limited
+  // body, the error reaches the handler while iterating the body
   nodeRequest.on('error', (error) => limitedBody.destroy(error));
   nodeRequest.on('close', () => {
     if (!nodeRequest.readableEnded) {
@@ -183,10 +196,7 @@ const limitBody = (
   // no unhandled 'error' event for a body nobody iterates, iterating the body still rejects with the error
   limitedBody.on('error', noop);
 
-  // pipe handles the backpressure and ends the limited body once the request ended
-  nodeRequest.pipe(limitedBody);
-
-  // a declared too large body gets rejected before reading it (pipe starts reading on the next tick), the body is
+  // a declared too large body gets rejected before reading it (the data listener starts reading on the next tick), the body is
   // the limited body as well: the same type, regardless of how the limit got exceeded
   if (Number(contentLength) > requestBodyMaxBytes) {
     const error = createError();
@@ -314,9 +324,10 @@ const toReadable = (body: Body): Readable => {
   return Readable.from(body, { objectMode: false });
 };
 
-// piped instead of using pipeline: pipeline creates an AbortController per call and aborts it once done, even on
-// success, the abort reason is a DOMException capturing a stack trace (about 3µs per response, which nobody reads)
-const sendBody = (body: Readable, nodeResponse: ServerResponse): void => {
+// written by hand instead of using pipeline or pipe: pipeline creates an AbortController per call and aborts it once
+// done, even on success, the abort reason is a DOMException capturing a stack trace (about 3µs per response, which
+// nobody reads), pipe adds and removes half a dozen listeners per response
+const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.Timeout | undefined): void => {
   // a failing response (e.g. a write after it got destroyed) must not surface as an unhandled 'error' event
   nodeResponse.on('error', noop);
 
@@ -328,16 +339,40 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse): void => {
     }
   });
 
-  // a response closed before it has been fully sent (client disconnected, response send timeout) stops the body,
-  // destroyed without an error: an async iterator gets returned (not thrown into), a web stream cancelled
+  // a closed response clears the send timeout (one close listener for both), a response closed before it has been
+  // fully sent (client disconnected, response send timeout) stops the body, destroyed without an error: an async
+  // iterator gets returned (not thrown into), a web stream cancelled
   nodeResponse.on('close', () => {
+    clearTimeout(timeout);
+
     if (!nodeResponse.writableFinished) {
       body.destroy();
     }
   });
 
-  // pipe handles the backpressure and ends the response once the body ended (also when it already did)
-  body.pipe(nodeResponse);
+  // an already ended body emits no 'end' anymore: there is nothing left to send
+  if (body.readableEnded) {
+    nodeResponse.end();
+
+    return;
+  }
+
+  // backpressure: a response not sent fast enough pauses the body until it got drained
+  body.on('data', (chunk: Buffer) => {
+    if (!nodeResponse.write(chunk)) {
+      body.pause();
+    }
+  });
+  nodeResponse.on('drain', () => body.resume());
+
+  body.on('end', () => nodeResponse.end());
+
+  // a 'data' listener does not resume an explicitly paused body
+  body.resume();
+};
+
+const destroyNotSentResponse = (nodeResponse: ServerResponse, responseSendTimeoutMs: number): void => {
+  nodeResponse.destroy(new Error(`Response has not been fully sent within ${responseSendTimeoutMs}ms`));
 };
 
 type ResponseToNodeResponseEmitter = (response: Response, nodeResponse: ServerResponse) => void;
@@ -346,7 +381,7 @@ export const createResponseToNodeResponseEmitter = (
   responseSendTimeoutMs: number | undefined = undefined,
 ): ResponseToNodeResponseEmitter => {
   return (response: Response, nodeResponse: ServerResponse): void => {
-    // a destroyed (e.g. errored) body cannot be sent anymore, piping it would destroy the connection: thrown before
+    // a destroyed (e.g. errored) body cannot be sent anymore, sending it would destroy the connection: thrown before
     // anything has been written, the caller is still able to send an error response
     if (response.body instanceof Readable && response.body.destroyed && !response.body.readableEnded) {
       throw new Error('Response body has already been destroyed');
@@ -365,15 +400,12 @@ export const createResponseToNodeResponseEmitter = (
 
     // slowloris protection: a client reading the response arbitrarily slow (or a stalling response
     // body stream) would otherwise keep the response (and its socket) alive forever
-    if (responseSendTimeoutMs !== undefined) {
-      const timeout = setTimeout(() => {
-        nodeResponse.destroy(new Error(`Response has not been fully sent within ${responseSendTimeoutMs}ms`));
-      }, responseSendTimeoutMs);
-      timeout.unref();
+    // without a closure per response, gets cleared by the close listener of sendBody
+    const timeout =
+      responseSendTimeoutMs !== undefined
+        ? setTimeout(destroyNotSentResponse, responseSendTimeoutMs, nodeResponse, responseSendTimeoutMs).unref()
+        : undefined;
 
-      nodeResponse.on('close', () => clearTimeout(timeout));
-    }
-
-    sendBody(toReadable(response.body), nodeResponse);
+    sendBody(toReadable(response.body), nodeResponse, timeout);
   };
 };

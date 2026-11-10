@@ -3,7 +3,7 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
 import type { TLSSocket } from 'node:tls';
 import { Readable, Writable } from 'node:stream';
-import { text } from 'node:stream/consumers';
+import { buffer, text } from 'node:stream/consumers';
 import { describe, expect, test, vi } from 'vitest';
 import { useFunctionMock } from '@chubbyts/chubbyts-function-mock/dist/function-mock';
 import type { ObjectMocks } from '@chubbyts/chubbyts-function-mock/dist/object-mock';
@@ -51,15 +51,22 @@ const createWriteHead = (
     return undefined as unknown as ServerResponse;
   }) as ServerResponse['writeHead'];
 
-// a writable as response: like a ServerResponse, it does not get destroyed once finished, but gets closed
-const createStreamNodeResponse = (writeHead: ServerResponse['writeHead']) => {
+// a writable as response: like a ServerResponse, it does not get destroyed once finished, but gets closed. A slow one
+// signals backpressure on every write (a high water mark of 1 byte, written on the next turn of the event loop)
+const createStreamNodeResponse = (writeHead: ServerResponse['writeHead'], slow = false) => {
   const chunks: Array<Buffer> = [];
 
   const nodeResponse = new Writable({
     autoDestroy: false,
+    ...(slow ? { highWaterMark: 1 } : {}),
     write: (chunk: Buffer, _encoding, callback) => {
       chunks.push(chunk);
-      callback();
+
+      if (slow) {
+        setImmediate(callback);
+      } else {
+        callback();
+      }
     },
   });
 
@@ -195,8 +202,8 @@ const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = [])
     httpVersion: '1.1',
   }) as unknown as IncomingMessage;
 
-// a stream request with a request body max bytes of 4, the implementation mocks verify the calls
-const createLimitedServerRequest = (nodeRequest: IncomingMessage) => {
+// a stream request with a request body max bytes (of 4 by default), the implementation mocks verify the calls
+const createLimitedServerRequest = (nodeRequest: IncomingMessage, requestBodyMaxBytes = 4) => {
   const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
     { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
   ]);
@@ -214,7 +221,7 @@ const createLimitedServerRequest = (nodeRequest: IncomingMessage) => {
     requestHelpers,
     'https://example.com',
     undefined,
-    4,
+    requestBodyMaxBytes,
   )(nodeRequest, nodeResponse);
 
   return { serverRequest, mocks: [nodeResponseMocks, ...mocks] };
@@ -1275,6 +1282,25 @@ describe('node', () => {
 
       expectAllMocksCalled(mocks);
     });
+
+    test('with body, with request body max bytes, with body not read', async () => {
+      const chunks = Array.from({ length: 16 }, (_, i) => Buffer.alloc(16 * 1024, i));
+
+      const nodeRequest = createStreamNodeRequest(Readable.from(chunks));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest, 1024 * 1024);
+
+      await wait(10);
+
+      // backpressure: the full limited body paused the request, instead of buffering the whole request body
+      expect(nodeRequest.isPaused()).toBe(true);
+      expect((serverRequest.body as Readable).readableLength).toBeLessThan(16 * 16 * 1024);
+
+      // reading the limited body resumes the request
+      expect((await buffer(serverRequest.body)).equals(Buffer.concat(chunks))).toBe(true);
+
+      expectAllMocksCalled(mocks);
+    });
   });
 
   describe('createResponseToNodeResponseEmitter', () => {
@@ -1312,6 +1338,37 @@ describe('node', () => {
       expect(Buffer.concat(chunks).toString()).toBe('some body');
       expect(nodeResponse.writableFinished).toBe(true);
       expect(nodeResponse.destroyed).toBe(false);
+    });
+
+    test('with node stream body, with response not sent fast enough', async () => {
+      const body = Readable.from([Buffer.from('some'), Buffer.from(' '), Buffer.from('body')], { objectMode: false });
+
+      const pauseSpy = vi.spyOn(body, 'pause');
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}), true);
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      // the body got paused until the response got drained, then resumed
+      expect(pauseSpy).toHaveBeenCalledTimes(3);
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with paused node stream body', async () => {
+      const body = Readable.from([Buffer.from('some body')], { objectMode: false });
+      body.pause();
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
     });
 
     test('with headers, copied and defined as own properties', async () => {
@@ -1428,12 +1485,14 @@ describe('node', () => {
 
       const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
 
-      const piped = new Promise<Readable>((resolve) => nodeResponse.once('pipe', resolve));
+      const fromSpy = vi.spyOn(Readable, 'from');
 
       createResponseToNodeResponseEmitter()(response, nodeResponse);
 
       // not in object mode: the backpressure is based on bytes, not on the number of chunks
-      expect((await piped).readableObjectMode).toBe(false);
+      expect((fromSpy.mock.results[0].value as Readable).readableObjectMode).toBe(false);
+
+      fromSpy.mockRestore();
 
       await closed;
 
