@@ -10,13 +10,24 @@ const defaultHttpsPort = 443;
 
 const noop = (): void => {};
 
+// node fires a timeout of NaN, a negative one or one above 2^31 - 1 (TIMEOUT_MAX) after 1ms: it would destroy every
+// request / response right away instead of protecting against slow clients
+const maxTimeoutMs = 2 ** 31 - 1;
+
+const validateTimeoutMs = (timeoutMs: number | undefined, name: string): void => {
+  if (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maxTimeoutMs)) {
+    throw new Error(`${name} "${timeoutMs}" must be an integer between 1 and ${maxTimeoutMs}`);
+  }
+};
+
 // credentials are singleton fields (RFC 9110 5.5): duplicates cannot be combined, a middleware
 // joining the values with ', ' (getHeaderLine) would confuse downstream auth parsing
 const singletonHeaderNames = new Set(['authorization', 'proxy-authorization']);
 
-const nodeRequestToHeaders = (nodeRequest: IncomingMessage): Map<string, Array<string>> => {
-  // a map instead of an object: a header named '__proto__' must not change the prototype
-  const headers = new Map<string, Array<string>>();
+const nodeRequestToHeaders = (nodeRequest: IncomingMessage): Record<string, Array<string>> => {
+  // a plain object, as the helpers take it: own properties only (a header named 'constructor' must not resolve to the
+  // prototype, one named '__proto__' must not change it)
+  const headers: Record<string, Array<string>> = {};
   const { rawHeaders } = nodeRequest;
 
   // oxlint-disable-next-line functional/no-let
@@ -30,10 +41,18 @@ const nodeRequestToHeaders = (nodeRequest: IncomingMessage): Map<string, Array<s
     }
 
     const value = rawHeaders[i + 1];
-    const values = headers.get(name);
+    const values = Object.hasOwn(headers, name) ? headers[name] : undefined;
 
     if (!values) {
-      headers.set(name, [value]);
+      // an assignment would call the prototype setter for '__proto__', defining every header is a lot slower
+      // Stryker disable next-line ConditionalExpression: defining every header results in the same, only slower
+      if (name === '__proto__') {
+        // oxlint-disable-next-line functional/immutable-data
+        Object.defineProperty(headers, name, { value: [value], enumerable: true, writable: true, configurable: true });
+      } else {
+        // oxlint-disable-next-line functional/immutable-data
+        headers[name] = [value];
+      }
 
       continue;
     }
@@ -84,9 +103,23 @@ const resolveBase = (base: string): { readonly origin: string; readonly pathPref
   return resolvedBase;
 };
 
+// a path the url parser keeps as it is: a single leading '/' (no other host), no dot segments ('/.', '%2e') and only
+// characters it does not percent-encode (RFC 3986 unreserved, sub-delims except "'" which gets encoded within the query
+// of special schemes, ':', '@', '/', '%' and a '?' starting the query)
+const unchangedPathPattern = /^\/(?![/\\])[\w\-.~!$&()*+,;=:@/%]*(?:\?[\w\-.~!$&()*+,;=:@/?%]*)?$/;
+const dotSegmentPattern = /\/\.|%2e/i;
+
 const resolveUrl = (path: string, base: string): string => {
   const { origin, pathPrefix } = resolveBase(base);
-  const url = new URL(pathPrefix + path, origin);
+  const prefixedPath = pathPrefix + path;
+
+  // parsing every request target is costly (several percent of a request), an opaque origin ('null') cannot be resolved
+  // against: such a path gets appended to the origin as it is, resolving it would result in the same url
+  if (origin !== 'null' && unchangedPathPattern.test(prefixedPath) && !dotSegmentPattern.test(prefixedPath)) {
+    return origin + prefixedPath;
+  }
+
+  const url = new URL(prefixedPath, origin);
 
   // protocol-relative ('//evil.com/path') and backslash ('/\evil.com/path') targets resolve
   // to a different host than the base url and must not be trusted
@@ -223,6 +256,8 @@ export const createNodeRequestToServerRequestFactory = (
     throw new Error(`Request body max bytes "${requestBodyMaxBytes}" must be a non-negative safe integer`);
   }
 
+  validateTimeoutMs(requestBodyTimeoutMs, 'Request body timeout ms');
+
   return (nodeRequest: IncomingMessage, nodeResponse: ServerResponse): ServerRequest => {
     const { method } = nodeRequest;
 
@@ -257,10 +292,9 @@ export const createNodeRequestToServerRequestFactory = (
     // withHeaders copies the request only once, withHeader once per header: optional for the implementations of 4.x
     const { withHeaders } = requestHelpers;
 
-    // Object.fromEntries defines the names as own properties: a header named '__proto__' does not change the prototype
     const serverRequest = withHeaders
-      ? (withHeaders.call(requestHelpers, serverRequestWithSignal, Object.fromEntries(headers)) as ServerRequest)
-      : [...headers].reduce(
+      ? (withHeaders.call(requestHelpers, serverRequestWithSignal, headers) as ServerRequest)
+      : Object.entries(headers).reduce(
           (request, [name, values]) => requestHelpers.withHeader(request, name, values),
           serverRequestWithSignal,
         );
@@ -288,7 +322,7 @@ export const createNodeRequestToServerRequestFactory = (
     if (requestBodyMaxBytes !== undefined) {
       return requestHelpers.withBody(
         serverRequest,
-        limitBody(nodeRequest, headers.get('content-length')?.[0], requestBodyMaxBytes),
+        limitBody(nodeRequest, headers['content-length']?.[0], requestBodyMaxBytes),
       );
     }
 
@@ -357,13 +391,14 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.
     return;
   }
 
-  // backpressure: a response not sent fast enough pauses the body until it got drained
+  // backpressure: a response not sent fast enough pauses the body until it got drained (a drain listener only then,
+  // instead of one for every response)
   body.on('data', (chunk: Buffer) => {
     if (!nodeResponse.write(chunk)) {
       body.pause();
+      nodeResponse.once('drain', () => body.resume());
     }
   });
-  nodeResponse.on('drain', () => body.resume());
 
   body.on('end', () => nodeResponse.end());
 
@@ -380,6 +415,8 @@ type ResponseToNodeResponseEmitter = (response: Response, nodeResponse: ServerRe
 export const createResponseToNodeResponseEmitter = (
   responseSendTimeoutMs: number | undefined = undefined,
 ): ResponseToNodeResponseEmitter => {
+  validateTimeoutMs(responseSendTimeoutMs, 'Response send timeout ms');
+
   return (response: Response, nodeResponse: ServerResponse): void => {
     // a destroyed (e.g. errored) body cannot be sent anymore, sending it would destroy the connection: thrown before
     // anything has been written, the caller is still able to send an error response

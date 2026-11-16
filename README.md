@@ -160,6 +160,9 @@ Slow clients (slowloris) can otherwise tie up sockets indefinitely:
  * `createResponseToNodeResponseEmitter(responseSendTimeoutMs)`: if the response has not been fully sent
    within the given time (slow reading client or stalling response body), the response gets destroyed.
 
+Both timeouts must be an integer between 1 and 2147483647 (the maximum delay of `setTimeout`), otherwise the factory
+throws: node would fire any other value after 1ms and destroy every request / response right away.
+
 The limit and both timeouts are optional and disabled by default. They only cover the body phases handled by this adapter,
 so make sure the node server level timeouts are configured as well: `server.headersTimeout` (slow header
 senders), `server.requestTimeout` and `server.keepAliveTimeout`.

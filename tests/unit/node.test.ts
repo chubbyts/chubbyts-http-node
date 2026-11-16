@@ -159,6 +159,13 @@ const useImplementationMocks = (
                     expect(Object.is(this, requestHelpers)).toBe(true);
                     expect(Object.getPrototypeOf(headers)).toBe(Object.prototype);
                     expect(Object.entries(headers)).toEqual(expected.headers ?? []);
+                    expect(
+                      Object.values(Object.getOwnPropertyDescriptors(headers)).map(
+                        ({ enumerable, writable, configurable }) => ({ enumerable, writable, configurable }),
+                      ),
+                    ).toEqual(
+                      (expected.headers ?? []).map(() => ({ enumerable: true, writable: true, configurable: true })),
+                    );
 
                     return {
                       ...message,
@@ -192,6 +199,15 @@ const expectAllMocksCalled = (mocks: ReadonlyArray<ReadonlyArray<unknown>>) => {
 };
 
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// the resolved url, or 'failed': resolving a url without throwing, to compare the outcomes of many of them at once
+const resolveOrFailed = (resolver: () => string): string => {
+  try {
+    return resolver();
+  } catch {
+    return 'failed';
+  }
+};
 
 // a real stream as request: the limited body gets piped from it
 const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = []): IncomingMessage =>
@@ -355,6 +371,80 @@ describe('node', () => {
 
       expect(nodeRequestMocks).toHaveLength(0);
     });
+
+    // the request targets the url parser keeps as they are get appended to the origin without parsing them: every
+    // combination of up to three of these parts has to result in the same url (or failure) as resolving it
+    test('with request targets combined of characters handled differently by the url parser', () => {
+      const parts = [
+        'a',
+        '_',
+        '~',
+        '-',
+        '.',
+        '..',
+        '!',
+        "'",
+        '(',
+        ':',
+        '@',
+        '/',
+        '\\',
+        '%',
+        '%2e',
+        '%2E',
+        '%41',
+        '?',
+        '#',
+      ];
+      const otherParts = ['=', '&', '+', ' ', '"', '<', '`', '{', '|', '^', '[', '\t', 'é'];
+      const baseUrls = [
+        'https://example.com',
+        'http://[::1]:8080/app/',
+        'https://example.com//evil.com',
+        'blob:https://example.com/uuid',
+        'file:///some/path',
+      ];
+
+      const combinations = [...parts, ...otherParts].flatMap((first) =>
+        [...parts, ''].flatMap((second) => [...parts, ''].map((third) => `/${first}${second}${third}`)),
+      );
+
+      const mismatches = baseUrls.flatMap((baseUrl) => {
+        const { origin, pathname } = new URL(baseUrl);
+        const pathPrefix = pathname.replace(/\/$/, '');
+
+        return combinations.flatMap((url) => {
+          const expected = resolveOrFailed(() => {
+            const resolved = new URL(pathPrefix + url, origin);
+
+            return resolved.origin === origin ? resolved.href : 'failed';
+          });
+
+          // a plain object instead of a mock: tens of thousands of requests
+          const actual = resolveOrFailed(() => getUrl({ url } as IncomingMessage, baseUrl));
+
+          return actual === expected ? [] : [{ baseUrl, url, expected, actual }];
+        });
+      });
+
+      expect(combinations.length).toBeGreaterThan(10_000);
+      expect(mismatches).toEqual([]);
+    });
+
+    test.each(['/', '/path/to/route', '/path/to/route?key=value&other=value', '/path/to/route?'])(
+      'with request target "%s", without resolving it',
+      (url) => {
+        // the base url gets parsed once (and cached)
+        getUrl({ url: '/' } as IncomingMessage, 'https://example.com/app');
+
+        const urlSpy = vi.spyOn(globalThis, 'URL');
+
+        expect(getUrl({ url } as IncomingMessage, 'https://example.com/app')).toBe(`https://example.com/app${url}`);
+        expect(urlSpy).not.toHaveBeenCalled();
+
+        urlSpy.mockRestore();
+      },
+    );
 
     test('with changing base urls', () => {
       expect(getUrlWithBaseUrl('https://example.com/one')).toBe('https://example.com/one/a');
@@ -1151,6 +1241,45 @@ describe('node', () => {
       },
     );
 
+    test.each([NaN, Infinity, -1, 0, 1.5, 2 ** 31])(
+      'with invalid request body timeout ms %s',
+      (requestBodyTimeoutMs) => {
+        const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+        const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+        const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+        expect(() =>
+          createNodeRequestToServerRequestFactory(
+            uriFactory,
+            serverRequestFactory,
+            requestHelpers,
+            'https://example.com',
+            requestBodyTimeoutMs,
+          ),
+        ).toThrow(`Request body timeout ms "${requestBodyTimeoutMs}" must be an integer between 1 and 2147483647`);
+
+        expect(uriFactoryMocks).toHaveLength(0);
+        expect(serverRequestFactoryMocks).toHaveLength(0);
+        expect(requestHelpersMocks).toHaveLength(0);
+      },
+    );
+
+    test.each([1, 2 ** 31 - 1])('with valid request body timeout ms %s', (requestBodyTimeoutMs) => {
+      const [uriFactory] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers] = useObjectMock<RequestHelpers>([]);
+
+      expect(() =>
+        createNodeRequestToServerRequestFactory(
+          uriFactory,
+          serverRequestFactory,
+          requestHelpers,
+          'https://example.com',
+          requestBodyTimeoutMs,
+        ),
+      ).not.toThrow();
+    });
+
     test('with body, with request body max bytes, with request body timeout, with stalling request', async () => {
       const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
 
@@ -1671,6 +1800,19 @@ describe('node', () => {
 
       expect(nodeResponse.writableFinished).toBe(true);
       expect(nodeResponse.destroyed).toBe(false);
+    });
+
+    test.each([NaN, Infinity, -1, 0, 1.5, 2 ** 31])(
+      'with invalid response send timeout ms %s',
+      (responseSendTimeoutMs) => {
+        expect(() => createResponseToNodeResponseEmitter(responseSendTimeoutMs)).toThrow(
+          `Response send timeout ms "${responseSendTimeoutMs}" must be an integer between 1 and 2147483647`,
+        );
+      },
+    );
+
+    test.each([1, 2 ** 31 - 1])('with valid response send timeout ms %s', (responseSendTimeoutMs) => {
+      expect(() => createResponseToNodeResponseEmitter(responseSendTimeoutMs)).not.toThrow();
     });
 
     test('with already destroyed body', () => {
