@@ -1,8 +1,11 @@
 /* oxlint-disable functional/immutable-data */
 
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { connect } from 'node:net';
 import type { TLSSocket } from 'node:tls';
-import { Readable, Writable } from 'node:stream';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { buffer, text } from 'node:stream/consumers';
 import { describe, expect, test, vi } from 'vitest';
 import { useFunctionMock } from '@chubbyts/chubbyts-function-mock/dist/function-mock';
@@ -53,6 +56,8 @@ const createWriteHead = (
 
 // a writable as response: like a ServerResponse, it does not get destroyed once finished, but gets closed. A slow one
 // signals backpressure on every write (a high water mark of 1 byte, written on the next turn of the event loop)
+type SocketWithWriteGeneric = { _writeGeneric: (...args: Array<unknown>) => unknown };
+
 const createStreamNodeResponse = (writeHead: ServerResponse['writeHead'], slow = false) => {
   const chunks: Array<Buffer> = [];
 
@@ -1498,6 +1503,141 @@ describe('node', () => {
 
       expect(Buffer.concat(chunks).toString()).toBe('some body');
       expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with node stream body, corked for the last chunk only', async () => {
+      const body = Readable.from([Buffer.from('some'), Buffer.from(' body')], { objectMode: false });
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      const writes: Array<boolean> = [];
+      const write = nodeResponse.write.bind(nodeResponse);
+      vi.spyOn(nodeResponse, 'write').mockImplementation((chunk: Buffer) => {
+        writes.push(nodeResponse.writableCorked > 0);
+
+        return write(chunk);
+      });
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      // the first chunk gets written as it is, the last one together with the end
+      expect(writes).toEqual([false, true]);
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableCorked).toBe(0);
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with async generator body, not corked', async () => {
+      const body = (async function* () {
+        yield Buffer.from('some');
+        yield Buffer.from(' body');
+      })();
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      const corkSpy = vi.spyOn(nodeResponse, 'cork');
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      // the end of a body still being read is unknown while writing a chunk: it is not delayed
+      expect(corkSpy).not.toHaveBeenCalled();
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+    });
+
+    test('with ended node stream body, with chunks left, corked for the last chunk only', async () => {
+      const body = new PassThrough();
+      body.write(Buffer.from('some'));
+      body.write(Buffer.from(' body'));
+      body.end();
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}));
+
+      const writes: Array<boolean> = [];
+      const write = nodeResponse.write.bind(nodeResponse);
+      vi.spyOn(nodeResponse, 'write').mockImplementation((chunk: Buffer) => {
+        writes.push(nodeResponse.writableCorked > 0);
+
+        return write(chunk);
+      });
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      // the end got pushed already, but a chunk follows: node would merge chunks written while corked into one
+      expect(writes).toEqual([false, true]);
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+    });
+
+    test('with node stream body, with response not sent fast enough, with the last chunk', async () => {
+      const body = Readable.from([Buffer.from('some'), Buffer.from(' body')], { objectMode: false });
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}), true);
+
+      const uncorkSpy = vi.spyOn(nodeResponse, 'uncork');
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      // the paused body cannot end: the corked last chunk gets sent on the next tick, the response drained
+      expect(uncorkSpy).not.toHaveBeenCalled();
+
+      await closed;
+
+      // only the corked last chunk gets uncorked, the first one has not been corked
+      expect(uncorkSpy).toHaveBeenCalledTimes(1);
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with node stream body, sent by node within a single write', async () => {
+      const emitter = createResponseToNodeResponseEmitter();
+
+      const writes = Promise.withResolvers<number>();
+
+      const server = createServer((_req, res) => {
+        // every write of the socket (a single chunk or several ones at once) goes through _writeGeneric
+        const writeSpy = vi.spyOn(res.socket as unknown as SocketWithWriteGeneric, '_writeGeneric');
+
+        res.once('finish', () => writes.resolve(writeSpy.mock.calls.length));
+
+        emitter(
+          createResponse({
+            headers: { 'content-type': ['text/plain'] },
+            body: Readable.from([Buffer.from('some body')], { objectMode: false }),
+          }),
+          res,
+        );
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+      try {
+        const { port } = server.address() as AddressInfo;
+
+        const raw = await new Promise<string>((resolve, reject) => {
+          const socket = connect(port, '127.0.0.1', () => {
+            socket.end('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+          });
+          const received: Array<Buffer> = [];
+          socket.on('data', (chunk: Buffer) => received.push(chunk));
+          socket.on('end', () => resolve(Buffer.concat(received).toString()));
+          socket.on('error', reject);
+        });
+
+        // head, chunk and terminating chunk at once, instead of head and chunk followed by the terminating chunk
+        expect(await writes.promise).toBe(1);
+
+        // the same bytes as before: chunked, the chunk and the terminating chunk
+        expect(raw).toMatch(/^HTTP\/1\.1 200 OK\r\n/);
+        expect(raw).toContain('\r\nTransfer-Encoding: chunked\r\n');
+        expect(raw.endsWith('\r\n\r\n9\r\nsome body\r\n0\r\n\r\n')).toBe(true);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
 
     test('with headers, copied and defined as own properties', async () => {

@@ -358,6 +358,13 @@ const toReadable = (body: Body): Readable => {
   return Readable.from(body, { objectMode: false });
 };
 
+// ended: the end of the body got pushed (no chunk follows), the 'end' event comes once the buffered chunks got read
+type ReadableWithState = Readable & { _readableState: { ended: boolean } };
+
+const uncorkResponse = (nodeResponse: ServerResponse): void => {
+  nodeResponse.uncork();
+};
+
 // written by hand instead of using pipeline or pipe: pipeline creates an AbortController per call and aborts it once
 // done, even on success, the abort reason is a DOMException capturing a stack trace (about 3µs per response, which
 // nobody reads), pipe adds and removes half a dozen listeners per response
@@ -394,9 +401,23 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.
   // backpressure: a response not sent fast enough pauses the body until it got drained (a drain listener only then,
   // instead of one for every response)
   body.on('data', (chunk: Buffer) => {
+    // the last chunk of a body read to its end already (e.g. one created from a buffer): node sends a written chunk on
+    // the next tick, the end (the terminating chunk) follows a tick later, two writes per response. Corked, end() sends
+    // both at once: the same bytes within one write. A body still being read (e.g. a file) is not delayed.
+    // oxlint-disable-next-line no-underscore-dangle
+    const isLastChunk = body.readableLength === 0 && (body as ReadableWithState)._readableState.ended;
+    if (isLastChunk) {
+      nodeResponse.cork();
+    }
+
     if (!nodeResponse.write(chunk)) {
       body.pause();
       nodeResponse.once('drain', () => body.resume());
+
+      // a paused body does not end: a corked response would never get drained, sent on the next tick as node does
+      if (isLastChunk) {
+        process.nextTick(uncorkResponse, nodeResponse);
+      }
     }
   });
 
