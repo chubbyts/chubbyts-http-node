@@ -361,8 +361,11 @@ const toReadable = (body: Body): Readable => {
 // ended: the end of the body got pushed (no chunk follows), the 'end' event comes once the buffered chunks got read
 type ReadableWithState = Readable & { _readableState: { ended: boolean } };
 
+// the body might have ended already (node < 26 emits the scheduled end of a paused body), end() fully uncorks then
 const uncorkResponse = (nodeResponse: ServerResponse): void => {
-  nodeResponse.uncork();
+  if (nodeResponse.writableCorked > 0) {
+    nodeResponse.uncork();
+  }
 };
 
 // written by hand instead of using pipeline or pipe: pipeline creates an AbortController per call and aborts it once
@@ -414,7 +417,7 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.
       body.pause();
       nodeResponse.once('drain', () => body.resume());
 
-      // a paused body does not end: a corked response would never get drained, sent on the next tick as node does
+      // a paused body might not end: a corked response would never get drained, sent on the next tick as node does
       if (isLastChunk) {
         process.nextTick(uncorkResponse, nodeResponse);
       }

@@ -1578,11 +1578,19 @@ describe('node', () => {
 
       const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}), true);
 
+      // the end comes after the next tick (node >= 26 does not emit the end of a paused body, node < 26 does)
+      const end = nodeResponse.end.bind(nodeResponse);
+      vi.spyOn(nodeResponse, 'end').mockImplementation(() => {
+        setImmediate(() => end());
+
+        return nodeResponse;
+      });
+
       const uncorkSpy = vi.spyOn(nodeResponse, 'uncork');
 
       createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
 
-      // the paused body cannot end: the corked last chunk gets sent on the next tick, the response drained
+      // the corked last chunk gets sent on the next tick, the response drained
       expect(uncorkSpy).not.toHaveBeenCalled();
 
       await closed;
@@ -1590,6 +1598,38 @@ describe('node', () => {
       // only the corked last chunk gets uncorked, the first one has not been corked
       expect(uncorkSpy).toHaveBeenCalledTimes(1);
       expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableCorked).toBe(0);
+      expect(nodeResponse.writableFinished).toBe(true);
+    });
+
+    test('with node stream body, with response not sent fast enough, with the last chunk uncorked already', async () => {
+      const body = Readable.from([Buffer.from('some'), Buffer.from(' body')], { objectMode: false });
+
+      const { nodeResponse, chunks, closed } = createStreamNodeResponse(createWriteHead(200, 'OK', {}), true);
+
+      // the response got uncorked before the next tick (e.g. by end(), node < 26 emits the end of a paused body)
+      const uncork = nodeResponse.uncork.bind(nodeResponse);
+      const write = nodeResponse.write.bind(nodeResponse);
+      vi.spyOn(nodeResponse, 'write').mockImplementation((chunk: Buffer) => {
+        const written = write(chunk);
+
+        if (nodeResponse.writableCorked > 0) {
+          uncork();
+        }
+
+        return written;
+      });
+
+      const uncorkSpy = vi.spyOn(nodeResponse, 'uncork');
+
+      createResponseToNodeResponseEmitter()(createResponse({ body }), nodeResponse);
+
+      await closed;
+
+      // an uncorked response does not get uncorked again
+      expect(uncorkSpy).not.toHaveBeenCalled();
+      expect(Buffer.concat(chunks).toString()).toBe('some body');
+      expect(nodeResponse.writableCorked).toBe(0);
       expect(nodeResponse.writableFinished).toBe(true);
     });
 
