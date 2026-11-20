@@ -2,6 +2,8 @@
 
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
+import type { ClientHttp2Session } from 'node:http2';
+import { connect as connectHttp2, createServer as createHttp2Server } from 'node:http2';
 import type { AddressInfo } from 'node:net';
 import { connect } from 'node:net';
 import type { TLSSocket } from 'node:tls';
@@ -14,6 +16,8 @@ import { useObjectMock } from '@chubbyts/chubbyts-function-mock/dist/object-mock
 import type { Body, Response, Uri } from '@chubbyts/chubbyts-http-types/message';
 import type { ServerRequestFactory, UriFactory } from '@chubbyts/chubbyts-http-types/message-factory';
 import type { RequestHelpers } from '@chubbyts/chubbyts-http-types/message-helper';
+import { createServerRequestFactory, createUriFactory } from '@chubbyts/chubbyts-http/message-factory';
+import { createServerRequestHelpers } from '@chubbyts/chubbyts-http/message-helper';
 import {
   createNodeRequestToServerRequestFactory,
   createResponseToNodeResponseEmitter,
@@ -224,15 +228,22 @@ const createStreamNodeRequest = (body: Readable, rawHeaders: Array<string> = [])
   }) as unknown as IncomingMessage;
 
 // a stream request with a request body max bytes (of 4 by default), the implementation mocks verify the calls
-const createLimitedServerRequest = (nodeRequest: IncomingMessage, requestBodyMaxBytes = 4) => {
+const createLimitedServerRequest = (
+  nodeRequest: IncomingMessage,
+  requestBodyMaxBytes = 4,
+  headers: Array<[string, Array<string>]> = [],
+  protocolVersion = '1.1',
+) => {
   const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+    { name: 'closed', value: false },
     { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
   ]);
 
   const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
     url: 'https://example.com/path/to/route',
     method: 'POST',
-    protocolVersion: '1.1',
+    protocolVersion,
+    headers,
     withBody: true,
   });
 
@@ -287,6 +298,7 @@ describe('node', () => {
       [{ localAddress: '127.0.0.1', localPort: 80 }, 'http://127.0.0.1/path/to/route'],
       [{}, 'http://127.0.0.1/path/to/route'],
       [{ localAddress: '::1', localPort: 8080 }, 'http://[::1]:8080/path/to/route'],
+      [{ localAddress: 'fe80::1%eth0', localPort: 8080 }, 'http://[fe80::1]:8080/path/to/route'],
     ])('without base url, with socket %j', (socket, expected) => {
       const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
         { name: 'url', value: '/path/to/route' },
@@ -294,6 +306,17 @@ describe('node', () => {
       ]);
 
       expect(getUrl(nodeRequest)).toBe(expected);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+    });
+
+    test('with empty base url, like without base url', () => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'url', value: '/path/to/route' },
+        { name: 'socket', value: createSocket({ localAddress: '192.168.1.5', localPort: 8080 }) },
+      ]);
+
+      expect(getUrl(nodeRequest, '')).toBe('http://192.168.1.5:8080/path/to/route');
 
       expect(nodeRequestMocks).toHaveLength(0);
     });
@@ -338,8 +361,6 @@ describe('node', () => {
       ['https://example.com:443/app/', '/a//b', 'https://example.com/app/a//b'],
       ['http://example.com:8080/app', '/../../a', 'http://example.com:8080/a'],
       ['https://user:password@example.com/app', '/a', 'https://example.com/app/a'],
-      // the authority of the target is the one of the base url, with the user info of the target
-      ['https://example.com', '//user@example.com/a', 'https://user@example.com/a'],
       // the path of a blob url is its inner url, which does not start with a '/'
       ['blob:https://example.com/uuid', '/a', 'https://example.com/uuid/a'],
     ])('with base url "%s", with request target "%s"', (baseUrl, url, expected) => {
@@ -351,6 +372,16 @@ describe('node', () => {
     });
 
     test.each([
+      [
+        'https://example.com',
+        '//user@example.com/a',
+        'Request target "//user@example.com/a" must not contain userinfo',
+      ],
+      [
+        'https://example.com',
+        '//:pass@example.com/a',
+        'Request target "//:pass@example.com/a" must not contain userinfo',
+      ],
       ['https://example.com//evil.com', '/a', 'resolves to origin "https://evil.com"'],
       ['file:///some/path', '/a', 'Invalid URL'],
       ['foo://example.com/app', '/a', 'Invalid URL'],
@@ -422,7 +453,9 @@ describe('node', () => {
           const expected = resolveOrFailed(() => {
             const resolved = new URL(pathPrefix + url, origin);
 
-            return resolved.origin === origin ? resolved.href : 'failed';
+            return resolved.origin === origin && resolved.username === '' && resolved.password === ''
+              ? resolved.href
+              : 'failed';
           });
 
           // a plain object instead of a mock: tens of thousands of requests
@@ -460,6 +493,61 @@ describe('node', () => {
       // a failing base url must not replace (parts of) the last one
       expect(() => getUrlWithBaseUrl('not-a-url')).toThrow('Invalid URL');
       expect(getUrlWithBaseUrl('https://example.com/one')).toBe('https://example.com/one/a');
+
+      // more than the bounded cache size (8) evicts old entries cleanly without failing
+      Array.from({ length: 10 }, (_, i) => i).forEach((i) => {
+        expect(getUrlWithBaseUrl(`https://example-${i}.com/app`)).toBe(`https://example-${i}.com/app/a`);
+      });
+    });
+
+    test('with more base urls than get cached', async () => {
+      // the cache is module state: a fresh module starts with an empty one
+      vi.resetModules();
+      const { getUrl: freshGetUrl } = await import('../../src/node.js');
+
+      // every parsing of a base url (the paths get appended without parsing them)
+      const parsed: Array<string> = [];
+
+      vi.stubGlobal(
+        'URL',
+        class extends URL {
+          constructor(input: string | URL, base?: string | URL) {
+            super(input, base);
+            parsed.push(String(input));
+          }
+        },
+      );
+
+      try {
+        const resolve = (i: number) =>
+          expect(freshGetUrl({ url: '/a' } as IncomingMessage, `https://example${i}.com`)).toBe(
+            `https://example${i}.com/a`,
+          );
+
+        // eight base urls get cached: each one parsed once
+        [1, 2, 3, 4, 5, 6, 7, 8].forEach(resolve);
+        resolve(1);
+
+        // a ninth one clears the full cache: the evicted ones get parsed again, the ninth one is cached
+        resolve(9);
+        resolve(2);
+        resolve(9);
+
+        expect(parsed).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 2].map((i) => `https://example${i}.com`));
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    test.each([null, undefined])('without base url, with detached %s socket', (socket) => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'url', value: '/path/to/route' },
+        { name: 'socket', value: socket as unknown as TLSSocket },
+      ]);
+
+      expect(getUrl(nodeRequest)).toBe('http://127.0.0.1/path/to/route');
+
+      expect(nodeRequestMocks).toHaveLength(0);
     });
   });
 
@@ -493,6 +581,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         {
           name: 'on',
           callback: ((event: string) => {
@@ -557,6 +646,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -633,6 +723,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -699,6 +790,7 @@ describe('node', () => {
         ]);
 
         const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+          { name: 'closed', value: false },
           { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
         ]);
 
@@ -745,6 +837,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -838,6 +931,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         {
           name: 'on',
           callback: ((event: string, listener: Listener) => {
@@ -901,6 +995,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -944,6 +1039,7 @@ describe('node', () => {
         { name: 'url', value: '/path/to/route' },
         { name: 'httpVersion', value: '1.1' },
         { name: 'on', callback: (() => nodeRequest) as IncomingMessage['on'] },
+        { name: 'closed', value: false },
         {
           name: 'on',
           callback: ((event: string) => {
@@ -963,6 +1059,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1006,6 +1103,7 @@ describe('node', () => {
         { name: 'url', value: '/path/to/route' },
         { name: 'httpVersion', value: '1.1' },
         { name: 'on', callback: (() => nodeRequest) as IncomingMessage['on'] },
+        { name: 'closed', value: false },
         {
           name: 'on',
           callback: ((event: string, listener: Listener) => {
@@ -1019,6 +1117,7 @@ describe('node', () => {
       ]);
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1064,6 +1163,7 @@ describe('node', () => {
         );
 
         const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+          { name: 'closed', value: false },
           { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
         ]);
 
@@ -1096,6 +1196,7 @@ describe('node', () => {
       const nodeRequest = createStreamNodeRequest(Readable.from([]));
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1142,6 +1243,7 @@ describe('node', () => {
       };
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1189,6 +1291,7 @@ describe('node', () => {
       );
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1213,6 +1316,13 @@ describe('node', () => {
       expect(nodeRequest.destroyed).toBe(true);
       expect(serverRequest.body).not.toBe(nodeRequest);
       expect((serverRequest.body as Readable).destroyed).toBe(true);
+
+      await wait(0);
+
+      // the error of the not (yet) iterated body must not surface as an unhandled 'error' event
+      expect((serverRequest.body as Readable).errored).toMatchObject({
+        message: 'Request body exceeds the maximum of 4 bytes',
+      });
 
       await expect(text(serverRequest.body)).rejects.toThrow('Request body exceeds the maximum of 4 bytes');
 
@@ -1289,6 +1399,7 @@ describe('node', () => {
       const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
         { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
       ]);
 
@@ -1368,14 +1479,57 @@ describe('node', () => {
 
       const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
 
-      // the request ended (and closed) before the handler reads the body: the body is still complete
-      await wait(10);
+      // reading started (e.g. a peek), the request ended (and closed) before the handler reads the rest of the body
+      (serverRequest.body as Readable).read(0);
 
+      await new Promise((resolve) => nodeRequest.once('close', resolve));
+
+      // the body is still complete
       expect(nodeRequest.readableEnded).toBe(true);
       expect(await text(serverRequest.body)).toBe('abcd');
 
       expectAllMocksCalled(mocks);
     });
+
+    test.each([
+      [[], []],
+      [['content-length', '0'], [['content-length', ['0']]]],
+    ] as Array<[Array<string>, Array<[string, Array<string>]>]>)(
+      'with body, with request body max bytes, with body read after the request ended, without a declared body, with headers %j',
+      async (rawHeaders, headers) => {
+        const nodeRequest = createStreamNodeRequest(Readable.from([]), rawHeaders);
+        nodeRequest.resume();
+        await new Promise((resolve) => nodeRequest.once('end', resolve));
+
+        const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest, 4, headers);
+
+        // the request ended before the handler reads the body, nothing got discarded: the body is empty
+        expect(nodeRequest.readableEnded).toBe(true);
+        expect(await text(serverRequest.body)).toBe('');
+
+        expectAllMocksCalled(mocks);
+      },
+    );
+
+    test.each([
+      [['content-length', '4'], [['content-length', ['4']]]],
+      [['transfer-encoding', 'chunked'], [['transfer-encoding', ['chunked']]]],
+    ] as Array<[Array<string>, Array<[string, Array<string>]>]>)(
+      'with body, with request body max bytes, with body read after the request ended, with a declared body, with headers %j',
+      async (rawHeaders, headers) => {
+        // node dumps the body nobody reads once the response has been sent: the request ends without the body
+        const nodeRequest = createStreamNodeRequest(Readable.from([Buffer.from('abcd')]), rawHeaders);
+        nodeRequest.resume();
+        await new Promise((resolve) => nodeRequest.once('close', resolve));
+
+        const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest, 4, headers);
+
+        // the data is gone: reading the body fails instead of silently resulting in an empty body
+        await expect(text(serverRequest.body)).rejects.toThrow('Request body has been discarded before it got read');
+
+        expectAllMocksCalled(mocks);
+      },
+    );
 
     test('with body, with request body max bytes, with body no longer read', async () => {
       const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
@@ -1426,12 +1580,238 @@ describe('node', () => {
 
       await wait(10);
 
+      const body = serverRequest.body as Readable;
+
+      // lazy flowing: nothing is buffered until the handler actually reads the body
+      expect(body.readableLength).toBe(0);
+
+      // reading starts: the request flows into the limited body
+      body.read(0);
+
+      await wait(10);
+
       // backpressure: the full limited body paused the request, instead of buffering the whole request body
       expect(nodeRequest.isPaused()).toBe(true);
-      expect((serverRequest.body as Readable).readableLength).toBeLessThan(16 * 16 * 1024);
+      expect(body.readableLength).toBeGreaterThan(0);
+      expect(body.readableLength).toBeLessThan(16 * 16 * 1024);
 
-      // reading the limited body resumes the request
-      expect((await buffer(serverRequest.body)).equals(Buffer.concat(chunks))).toBe(true);
+      expect((await buffer(body)).equals(Buffer.concat(chunks))).toBe(true);
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with empty base url, like without base url', () => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'method', value: 'GET' },
+        { name: 'rawHeaders', value: [] },
+        { name: 'url', value: '/path/to/route' },
+        { name: 'socket', value: createSocket({ localAddress: '192.168.1.5', localPort: 8080 }) },
+        { name: 'httpVersion', value: '1.1' },
+      ]);
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'http://192.168.1.5:8080/path/to/route',
+        method: 'GET',
+        protocolVersion: '1.1',
+      });
+
+      createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        '',
+      )(nodeRequest, nodeResponse);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with http/2, read right away', async () => {
+      const chunks = Array.from({ length: 16 }, (_, i) => Buffer.alloc(16 * 1024, i));
+
+      const nodeRequest = Object.assign(createStreamNodeRequest(Readable.from(chunks)), { httpVersion: '2.0' });
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest, 1024 * 1024, [], '2');
+
+      await wait(10);
+
+      const body = serverRequest.body as Readable;
+
+      // http/2 has no dump of an unread body: the request flows into the limited body before the handler reads it,
+      // backpressure pauses it until the handler does
+      expect(body.readableLength).toBeGreaterThan(0);
+      expect(body.readableLength).toBeLessThan(16 * 16 * 1024);
+      expect(nodeRequest.isPaused()).toBe(true);
+
+      expect((await buffer(body)).equals(Buffer.concat(chunks))).toBe(true);
+
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body max bytes, with http/2, with bodies not read by the handler', async () => {
+      const nodeRequestToServerRequestFactory = createNodeRequestToServerRequestFactory(
+        createUriFactory(),
+        createServerRequestFactory(),
+        createServerRequestHelpers(),
+        'https://example.com',
+        undefined,
+        1024 * 1024,
+      );
+
+      const emitter = createResponseToNodeResponseEmitter();
+
+      // the handler responds without reading the body (e.g. 401)
+      const server = createHttp2Server((req, res) => {
+        nodeRequestToServerRequestFactory(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+        emitter(createResponse({ status: 401, reasonPhrase: '' }), res as unknown as ServerResponse);
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+      const { port } = server.address() as AddressInfo;
+      const session: ClientHttp2Session = connectHttp2(`http://127.0.0.1:${port}`);
+      session.on('error', () => {});
+
+      const post = (): Promise<string> =>
+        new Promise((resolve) => {
+          const stream = session.request({ ':method': 'POST', ':path': '/', 'content-length': 128 * 1024 });
+          const status = { value: 'none' };
+          // oxlint-disable-next-line functional/immutable-data
+          stream.on('response', (headers) => (status.value = String(headers[':status'])));
+          stream.on('error', (error: NodeJS.ErrnoException) => (status.value = error.code ?? error.message));
+          stream.on('close', () => resolve(status.value));
+          stream.resume();
+          stream.end(Buffer.alloc(128 * 1024));
+        });
+
+      try {
+        const statuses: Array<string> = [];
+
+        // oxlint-disable-next-line functional/no-let
+        for (let i = 0; i < 200; i++) {
+          // oxlint-disable-next-line functional/immutable-data
+          statuses.push(await post());
+        }
+
+        // unread stream data would reset the streams and the client sending on would reset the whole session
+        // (NGHTTP2_ENHANCE_YOUR_CALM), failing the other requests on it
+        expect(statuses).toEqual(Array.from({ length: 200 }, () => '401'));
+      } finally {
+        session.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    });
+
+    test('with invalid base url, fails fast at factory creation', () => {
+      const [uriFactory, uriFactoryMocks] = useFunctionMock<UriFactory>([]);
+      const [serverRequestFactory, serverRequestFactoryMocks] = useFunctionMock<ServerRequestFactory>([]);
+      const [requestHelpers, requestHelpersMocks] = useObjectMock<RequestHelpers>([]);
+
+      expect(() =>
+        createNodeRequestToServerRequestFactory(uriFactory, serverRequestFactory, requestHelpers, 'not-a-url'),
+      ).toThrow('Invalid URL');
+
+      expect(uriFactoryMocks).toHaveLength(0);
+      expect(serverRequestFactoryMocks).toHaveLength(0);
+      expect(requestHelpersMocks).toHaveLength(0);
+    });
+
+    test.each([
+      [false, true],
+      [true, false],
+    ])('with already closed response, with writableFinished %s', (writableFinished, aborted) => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'method', value: 'GET' },
+        { name: 'rawHeaders', value: [] },
+        { name: 'url', value: '/' },
+        { name: 'httpVersion', value: '1.1' },
+      ]);
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: true },
+        { name: 'writableFinished', value: writableFinished },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/',
+        method: 'GET',
+        protocolVersion: '1.1',
+      });
+
+      const serverRequest = createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+      )(nodeRequest, nodeResponse);
+
+      expect(serverRequest.signal.aborted).toBe(aborted);
+
+      expect(nodeRequestMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test('with body, with request body timeout, with already closed request', () => {
+      const [nodeRequest, nodeRequestMocks] = useObjectMock<IncomingMessage>([
+        { name: 'method', value: 'POST' },
+        { name: 'rawHeaders', value: [] },
+        { name: 'url', value: '/path/to/route' },
+        { name: 'httpVersion', value: '1.1' },
+        { name: 'on', callback: (() => nodeRequest) as IncomingMessage['on'] },
+        { name: 'closed', value: true },
+      ]);
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
+        { name: 'on', callback: (() => nodeResponse) as ServerResponse['on'] },
+      ]);
+
+      const { uriFactory, serverRequestFactory, requestHelpers, mocks } = useImplementationMocks({
+        url: 'https://example.com/path/to/route',
+        method: 'POST',
+        protocolVersion: '1.1',
+        withBody: true,
+      });
+
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      createNodeRequestToServerRequestFactory(
+        uriFactory,
+        serverRequestFactory,
+        requestHelpers,
+        'https://example.com',
+        50,
+      )(nodeRequest, nodeResponse);
+
+      // no timer is scheduled for an already closed request
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+      setTimeoutSpy.mockRestore();
+
+      expect(nodeRequestMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+      expectAllMocksCalled(mocks);
+    });
+
+    test.each([
+      [new Error('aborted'), 'aborted'],
+      [undefined, 'Request body has been closed before it ended'],
+    ])('with body, with request body max bytes, with already closed request (error: %s)', async (error, expected) => {
+      const nodeRequest = createStreamNodeRequest(new Readable({ read: () => {} }));
+      nodeRequest.on('error', () => {});
+      nodeRequest.destroy(error);
+      await new Promise((resolve) => nodeRequest.once('close', resolve));
+
+      const { serverRequest, mocks } = createLimitedServerRequest(nodeRequest);
+
+      await expect(text(serverRequest.body)).rejects.toThrow(expected);
 
       expectAllMocksCalled(mocks);
     });
@@ -1706,14 +2086,14 @@ describe('node', () => {
       expect(Object.getPrototypeOf(nodeHeaders)).toBeNull();
       expect(Object.entries(nodeHeaders)).toEqual([
         ['x-custom', ['value1', 'value2']],
-        ['__proto__', ['value3']],
+        ['__proto__', 'value3'],
         ['x-iterable', ['value4']],
       ]);
 
       // node keeps the given arrays: the ones of the response must not be changeable through them
       expect(nodeHeaders['x-custom']).not.toBe(values);
-      expect(Object.getOwnPropertyDescriptor(nodeHeaders, '__proto__')?.value).not.toBe(protoValues);
       expect(Object.getOwnPropertyDescriptor(nodeHeaders, '__proto__')).toMatchObject({
+        value: 'value3',
         enumerable: true,
         writable: true,
         configurable: true,
@@ -2043,7 +2423,9 @@ describe('node', () => {
       const response = createResponse({ headers: { 'x-custom': ['somevalue'] }, body });
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
-        { name: 'writeHead', callback: createWriteHead(200, 'OK', { 'x-custom': ['somevalue'] }, error) },
+        { name: 'closed', value: false },
+        { name: 'destroyed', value: false },
+        { name: 'writeHead', callback: createWriteHead(200, 'OK', { 'x-custom': 'somevalue' }, error) },
       ]);
 
       const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter();
@@ -2067,6 +2449,8 @@ describe('node', () => {
       const response = createResponse({ body });
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
+        { name: 'destroyed', value: false },
         { name: 'writeHead', callback: createWriteHead(200, 'OK', {}, error) },
       ]);
 
@@ -2091,6 +2475,8 @@ describe('node', () => {
       const response = createResponse({ body });
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
+        { name: 'destroyed', value: false },
         { name: 'writeHead', callback: createWriteHead(200, 'OK', {}, error) },
       ]);
 
@@ -2116,6 +2502,8 @@ describe('node', () => {
       const response = createResponse({ body });
 
       const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([
+        { name: 'closed', value: false },
+        { name: 'destroyed', value: false },
         { name: 'writeHead', callback: createWriteHead(200, 'OK', {}, error) },
       ]);
 
@@ -2123,6 +2511,58 @@ describe('node', () => {
 
       expect(() => responseToNodeResponseEmitter(response, nodeResponse)).toThrow(error);
 
+      expect(bodyMocks).toHaveLength(0);
+      expect(nodeResponseMocks).toHaveLength(0);
+    });
+
+    test('with locked web stream body', () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+        },
+      });
+      body.getReader();
+
+      // nothing gets written to the response and no timeout is scheduled
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>([]);
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      const responseToNodeResponseEmitter = createResponseToNodeResponseEmitter(50);
+
+      expect(() => responseToNodeResponseEmitter(createResponse({ body }), nodeResponse)).toThrow(
+        'Response body is locked',
+      );
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+      setTimeoutSpy.mockRestore();
+      expect(nodeResponseMocks).toHaveLength(0);
+    });
+
+    test.each([
+      [true, false],
+      [false, true],
+    ])('with already closed (%s) or destroyed (%s) response', (closed, destroyed) => {
+      const [body, bodyMocks] = useObjectMock<{ destroy: () => void } & Body>([
+        { name: 'destroy', callback: () => undefined },
+        { name: 'destroy', parameters: [] },
+      ]);
+
+      const [nodeResponse, nodeResponseMocks] = useObjectMock<ServerResponse>(
+        closed
+          ? [{ name: 'closed', value: true }]
+          : [
+              { name: 'closed', value: false },
+              { name: 'destroyed', value: destroyed },
+            ],
+      );
+
+      const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+
+      createResponseToNodeResponseEmitter(50)(createResponse({ body }), nodeResponse);
+
+      expect(setTimeoutSpy).not.toHaveBeenCalled();
+
+      setTimeoutSpy.mockRestore();
       expect(bodyMocks).toHaveLength(0);
       expect(nodeResponseMocks).toHaveLength(0);
     });

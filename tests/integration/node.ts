@@ -78,6 +78,10 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     console.error(`Failed to handle request: ${error}`);
 
+    if (res.destroyed || res.closed) {
+      return;
+    }
+
     // once headers are sent the response cannot be turned into a 500 anymore:
     // destroying the socket is the only way to signal the failure to the client
     if (res.headersSent) {
