@@ -71,34 +71,50 @@ const nodeRequestToHeaders = (nodeRequest: IncomingMessage): Record<string, Arra
 
 const headersToNodeHeaders = (headers: Headers): OutgoingHttpHeaders => {
   // without a prototype: a header named '__proto__' is a header like any other
-  const nodeHeaders: Record<string, Array<string>> = Object.create(null);
+  const nodeHeaders: Record<string, string | Array<string>> = Object.create(null);
 
   for (const name of Object.keys(headers)) {
-    // node sends every value of an array as its own header line, which is required for set-cookie (RFC 6265 3)
+    const values = headers[name];
+
+    // a single string value avoids cloning an array (and iterating it inside node's writeHead);
+    // multiple values stay as a fresh array so node sends every value as its own header line (RFC 6265 3)
     // oxlint-disable-next-line functional/immutable-data
-    nodeHeaders[name] = [...headers[name]];
+    nodeHeaders[name] = Array.isArray(values) && values.length === 1 ? values[0] : [...values];
   }
 
   return nodeHeaders;
 };
 
-// the base url is the same for (nearly) every request: the given one, or the local address of the socket, its parsed
-// parts get reused as long as it does not change (a single entry: nothing a client could grow)
-const resolvedBases: { last?: { readonly base: string; readonly origin: string; readonly pathPrefix: string } } = {};
+type ResolvedBase = { readonly origin: string; readonly pathPrefix: string };
 
-const resolveBase = (base: string): { readonly origin: string; readonly pathPrefix: string } => {
-  const { last } = resolvedBases;
+const maxResolvedBases = 8;
+
+// bounded cache for getUrl without a pre-resolved base (e.g. dual-stack IPv4/IPv6 sockets):
+// avoids thrashing on alternating local addresses while staying strictly bounded
+const resolvedBases = new Map<string, ResolvedBase>();
+
+const parseBase = (base: string): ResolvedBase => {
+  const parsedBase = new URL(base);
+
+  return { origin: parsedBase.origin, pathPrefix: parsedBase.pathname.replace(/\/$/, '') };
+};
+
+const resolveBase = (base: string): ResolvedBase => {
+  const cached = resolvedBases.get(base);
 
   // Stryker disable next-line ConditionalExpression,BlockStatement: parsing it again results in the same, only slower
-  if (last?.base === base) {
-    return last;
+  if (cached) {
+    return cached;
   }
 
-  const parsedBase = new URL(base);
-  const resolvedBase = { base, origin: parsedBase.origin, pathPrefix: parsedBase.pathname.replace(/\/$/, '') };
+  const resolvedBase = parseBase(base);
 
-  // oxlint-disable-next-line functional/immutable-data
-  resolvedBases.last = resolvedBase;
+  // a full cache gets cleared: bounded, nothing a client could grow
+  if (resolvedBases.size >= maxResolvedBases) {
+    resolvedBases.clear();
+  }
+
+  resolvedBases.set(base, resolvedBase);
 
   return resolvedBase;
 };
@@ -109,8 +125,7 @@ const resolveBase = (base: string): { readonly origin: string; readonly pathPref
 const unchangedPathPattern = /^\/(?![/\\])[\w\-.~!$&()*+,;=:@/%]*(?:\?[\w\-.~!$&()*+,;=:@/?%]*)?$/;
 const dotSegmentPattern = /\/\.|%2e/i;
 
-const resolveUrl = (path: string, base: string): string => {
-  const { origin, pathPrefix } = resolveBase(base);
+const resolveUrlWithBase = (path: string, { origin, pathPrefix }: ResolvedBase): string => {
   const prefixedPath = pathPrefix + path;
 
   // parsing every request target is costly (several percent of a request), an opaque origin ('null') cannot be resolved
@@ -129,10 +144,15 @@ const resolveUrl = (path: string, base: string): string => {
     );
   }
 
+  // same-origin protocol-relative targets ('//user@example.com/path') keep the origin but inject userinfo
+  if (url.username !== '' || url.password !== '') {
+    throw new Error(`Request target "${path}" must not contain userinfo`);
+  }
+
   return url.href;
 };
 
-export const getUrl = (nodeRequest: IncomingMessage, baseUrl: string | undefined = undefined): string => {
+const getRequestPath = (nodeRequest: IncomingMessage): string => {
   const path = nodeRequest.url ?? '/';
 
   // only origin-form request targets can be safely appended after a host: absolute-form
@@ -142,18 +162,27 @@ export const getUrl = (nodeRequest: IncomingMessage, baseUrl: string | undefined
     throw new Error(`Unsupported request target "${path}": only origin-form (starting with "/") is supported`);
   }
 
-  if (baseUrl) {
-    return resolveUrl(path, baseUrl);
-  }
+  return path;
+};
 
+const getSocketBase = (nodeRequest: IncomingMessage): string => {
   const { socket } = nodeRequest;
-  const encrypted = 'encrypted' in socket && socket.encrypted === true;
+  const encrypted = socket !== null && socket !== undefined && 'encrypted' in socket && socket.encrypted === true;
   const schema = encrypted ? 'https' : 'http';
-  const address = socket.localAddress ?? '127.0.0.1';
+  // strip IPv6 zone ID (e.g. 'fe80::1%eth0') which WHATWG URL rejects
+  const rawAddress = socket?.localAddress ?? '127.0.0.1';
+  const address = rawAddress.includes('%') ? rawAddress.slice(0, rawAddress.indexOf('%')) : rawAddress;
   const host = address.includes(':') ? `[${address}]` : address;
-  const port = socket.localPort ?? (encrypted ? defaultHttpsPort : defaultHttpPort);
+  const port = socket?.localPort ?? (encrypted ? defaultHttpsPort : defaultHttpPort);
 
-  return resolveUrl(path, `${schema}://${host}:${port}`);
+  return `${schema}://${host}:${port}`;
+};
+
+export const getUrl = (nodeRequest: IncomingMessage, baseUrl: string | undefined = undefined): string => {
+  const path = getRequestPath(nodeRequest);
+
+  // an empty base url means none: the url gets built from the local address of the socket
+  return resolveUrlWithBase(path, resolveBase(baseUrl || getSocketBase(nodeRequest)));
 };
 
 // node reports HTTP/2 as '2.0', the types expect '2'
@@ -168,74 +197,121 @@ const getProtocolVersion = (nodeRequest: IncomingMessage): string => {
 const limitBody = (
   nodeRequest: IncomingMessage,
   contentLength: string | undefined,
+  transferEncoding: string | undefined,
   requestBodyMaxBytes: number,
+  readEagerly: boolean,
 ): Body => {
   const createError = (): Error => new Error(`Request body exceeds the maximum of ${requestBodyMaxBytes} bytes`);
 
-  const received = { bytes: 0 };
+  // a declared too large body gets rejected before attaching any listeners or reading the body;
+  // still returns a destroyed Readable so the body type is identical regardless of how the limit got exceeded
+  if (Number(contentLength) > requestBodyMaxBytes) {
+    const error = createError();
+    // never read: destroyed right away
+    const limitedBody = new Readable();
+    limitedBody.on('error', noop);
 
-  // a readable fed by the request instead of a transform piped from it: a transform is a readable and a writable, pipe
-  // adds and removes half a dozen listeners per request. Reading the limited body resumes the paused request.
-  const limitedBody = new Readable({
-    read: () => {
-      nodeRequest.resume();
-    },
-  });
+    nodeRequest.destroy(error);
+    limitedBody.destroy(error);
 
-  // a chunked body (or one with a wrong content-length) gets limited while reading it
-  nodeRequest.on('data', (chunk: Buffer) => {
+    return limitedBody;
+  }
+
+  const state = { bytes: 0, attached: false };
+
+  // feeds the limited body from the request: a readable fed by the request instead of a transform piped from it, a
+  // transform is a readable and a writable, pipe adds and removes half a dozen listeners per request
+  const attach = (): void => {
+    if (state.attached) {
+      return;
+    }
+
     // oxlint-disable-next-line functional/immutable-data
-    received.bytes += chunk.length;
+    state.attached = true;
 
-    if (received.bytes > requestBodyMaxBytes) {
-      const error = createError();
-
-      // both sides get destroyed right away (the close listeners would defer it to the next ticks): the connection
-      // gets closed before the handler, getting the error while iterating the body, could respond while the client is
-      // still sending
-      nodeRequest.destroy(error);
-      limitedBody.destroy(error);
+    // the request ended before its body got read: node discarded the body (it dumps the body nobody reads once the
+    // response has been sent), an empty body would silently lose the data of a request that declared one
+    if (nodeRequest.readableEnded) {
+      if (transferEncoding !== undefined || Number(contentLength) > 0) {
+        limitedBody.destroy(new Error('Request body has been discarded before it got read'));
+      } else {
+        // oxlint-disable-next-line functional/immutable-data
+        limitedBody.push(null);
+      }
 
       return;
     }
 
-    // backpressure: a limited body not read fast enough pauses the request until it gets read
+    // a chunked body (or one with a wrong content-length) gets limited while reading it
+    nodeRequest.on('data', (chunk: Buffer) => {
+      // oxlint-disable-next-line functional/immutable-data
+      state.bytes += chunk.length;
+
+      if (state.bytes > requestBodyMaxBytes) {
+        const error = createError();
+
+        // both sides get destroyed right away (the close listeners would defer it to the next ticks): the connection
+        // gets closed before the handler, getting the error while iterating the body, could respond while the client is
+        // still sending
+        nodeRequest.destroy(error);
+        limitedBody.destroy(error);
+
+        return;
+      }
+
+      // backpressure: a limited body not read fast enough pauses the request until it gets read
+      // oxlint-disable-next-line functional/immutable-data
+      if (!limitedBody.push(chunk)) {
+        nodeRequest.pause();
+      }
+    });
+
     // oxlint-disable-next-line functional/immutable-data
-    if (!limitedBody.push(chunk)) {
-      nodeRequest.pause();
-    }
-  });
+    nodeRequest.on('end', () => limitedBody.push(null));
+  };
 
-  // oxlint-disable-next-line functional/immutable-data
-  nodeRequest.on('end', () => limitedBody.push(null));
+  // attached on the first read (http/1): node dumps the body of a request nobody reads once the response has been sent,
+  // a handler that never reads it (e.g. 401/404) neither buffers it nor keeps the request from ending
+  const limitedBody = new Readable({
+    read: () => {
+      attach();
+      nodeRequest.resume();
+    },
+    // synchronously destroy the request when the handler stops reading the body, so no further chunks arrive on the
+    // same tick and the client stops sending
+    destroy: (error, callback) => {
+      if (!nodeRequest.readableEnded && !nodeRequest.destroyed) {
+        nodeRequest.destroy();
+      }
 
-  // the failures get propagated by hand: a destroyed request (client abort, request body timeout) destroys the limited
-  // body, the error reaches the handler while iterating the body
-  nodeRequest.on('error', (error) => limitedBody.destroy(error));
-  nodeRequest.on('close', () => {
-    if (!nodeRequest.readableEnded) {
-      limitedBody.destroy(new Error('Request body has been closed before it ended'));
-    }
-  });
-
-  // a limited body no longer read (the handler stopped iterating it) stops receiving the request, the client would
-  // otherwise keep on sending the body
-  limitedBody.on('close', () => {
-    if (!nodeRequest.readableEnded) {
-      nodeRequest.destroy();
-    }
+      callback(error);
+    },
   });
 
   // no unhandled 'error' event for a body nobody iterates, iterating the body still rejects with the error
   limitedBody.on('error', noop);
 
-  // a declared too large body gets rejected before reading it (the data listener starts reading on the next tick), the body is
-  // the limited body as well: the same type, regardless of how the limit got exceeded
-  if (Number(contentLength) > requestBodyMaxBytes) {
-    const error = createError();
+  // the failures get propagated by hand: a destroyed request (client abort, request body timeout) destroys the limited
+  // body, the error reaches the handler while iterating the body
+  nodeRequest.on('error', (error) => limitedBody.destroy(error));
 
-    nodeRequest.destroy(error);
-    limitedBody.destroy(error);
+  if (nodeRequest.closed) {
+    if (!nodeRequest.readableEnded) {
+      limitedBody.destroy(nodeRequest.errored ?? new Error('Request body has been closed before it ended'));
+    }
+  } else {
+    nodeRequest.on('close', () => {
+      if (!nodeRequest.readableEnded && !limitedBody.destroyed) {
+        limitedBody.destroy(new Error('Request body has been closed before it ended'));
+      }
+    });
+  }
+
+  // http/2 has no dump: the unread data of a stream gets the stream reset once the response has been sent, the client
+  // sending on resets the whole session (NGHTTP2_ENHANCE_YOUR_CALM), failing the other requests on it. Read right away,
+  // the limited body buffers the body (and backpressure pauses the request) until the handler reads it
+  if (readEagerly) {
+    attach();
   }
 
   return limitedBody;
@@ -258,6 +334,10 @@ export const createNodeRequestToServerRequestFactory = (
 
   validateTimeoutMs(requestBodyTimeoutMs, 'Request body timeout ms');
 
+  // pre-resolve the base url once per factory: fails fast on invalid base url and avoids per-request cache lookups, an
+  // empty base url means none (as with getUrl): the url gets built from the local address of the socket
+  const resolvedBase = baseUrl ? parseBase(baseUrl) : undefined;
+
   return (nodeRequest: IncomingMessage, nodeResponse: ServerResponse): ServerRequest => {
     const { method } = nodeRequest;
 
@@ -269,23 +349,29 @@ export const createNodeRequestToServerRequestFactory = (
 
     const headers = nodeRequestToHeaders(nodeRequest);
 
-    const uri = uriFactory(getUrl(nodeRequest, baseUrl));
+    const url = resolvedBase ? resolveUrlWithBase(getRequestPath(nodeRequest), resolvedBase) : getUrl(nodeRequest);
+    const uri = uriFactory(url);
 
     // the request is no longer needed once the response got closed without having been fully sent:
     // the client disconnected, or the response got destroyed (e.g. by the response send timeout)
     const abortController = new AbortController();
 
-    nodeResponse.on('close', () => {
+    if (nodeResponse.closed) {
       if (!nodeResponse.writableFinished) {
         abortController.abort();
       }
-    });
+    } else {
+      nodeResponse.on('close', () => {
+        if (!nodeResponse.writableFinished) {
+          abortController.abort();
+        }
+      });
+    }
 
     // created and changed through the injected implementation only: the bridge works with any of them
-    const createdServerRequest = requestHelpers.withProtocolVersion(
-      serverRequestFactory(method, uri),
-      getProtocolVersion(nodeRequest),
-    );
+    const protocolVersion = getProtocolVersion(nodeRequest);
+
+    const createdServerRequest = requestHelpers.withProtocolVersion(serverRequestFactory(method, uri), protocolVersion);
 
     const serverRequestWithSignal = requestHelpers.withSignal(createdServerRequest, abortController.signal);
 
@@ -310,7 +396,7 @@ export const createNodeRequestToServerRequestFactory = (
 
     // slowloris protection: a client sending the body arbitrarily slow would otherwise keep the
     // request (and its socket) alive forever, the error reaches the handler while iterating the body
-    if (requestBodyTimeoutMs !== undefined) {
+    if (requestBodyTimeoutMs !== undefined && !nodeRequest.closed) {
       const timeout = setTimeout(() => {
         nodeRequest.destroy(new Error(`Request body has not been fully received within ${requestBodyTimeoutMs}ms`));
       }, requestBodyTimeoutMs);
@@ -322,7 +408,13 @@ export const createNodeRequestToServerRequestFactory = (
     if (requestBodyMaxBytes !== undefined) {
       return requestHelpers.withBody(
         serverRequest,
-        limitBody(nodeRequest, headers['content-length']?.[0], requestBodyMaxBytes),
+        limitBody(
+          nodeRequest,
+          headers['content-length']?.[0],
+          headers['transfer-encoding']?.[0],
+          requestBodyMaxBytes,
+          protocolVersion === '2',
+        ),
       );
     }
 
@@ -375,14 +467,6 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.
   // a failing response (e.g. a write after it got destroyed) must not surface as an unhandled 'error' event
   nodeResponse.on('error', noop);
 
-  // a failing body destroys the response: the client must not take a truncated body for a complete one
-  body.on('error', (error) => nodeResponse.destroy(error));
-  body.on('close', () => {
-    if (!body.readableEnded) {
-      nodeResponse.destroy(new Error('Response body has been closed before it ended'));
-    }
-  });
-
   // a closed response clears the send timeout (one close listener for both), a response closed before it has been
   // fully sent (client disconnected, response send timeout) stops the body, destroyed without an error: an async
   // iterator gets returned (not thrown into), a web stream cancelled
@@ -394,12 +478,20 @@ const sendBody = (body: Readable, nodeResponse: ServerResponse, timeout: NodeJS.
     }
   });
 
-  // an already ended body emits no 'end' anymore: there is nothing left to send
+  // an already ended body emits no 'end' anymore: there is nothing left to send (skip body listeners)
   if (body.readableEnded) {
     nodeResponse.end();
 
     return;
   }
+
+  // a failing body destroys the response: the client must not take a truncated body for a complete one
+  body.on('error', (error) => nodeResponse.destroy(error));
+  body.on('close', () => {
+    if (!body.readableEnded && !nodeResponse.destroyed) {
+      nodeResponse.destroy(new Error('Response body has been closed before it ended'));
+    }
+  });
 
   // backpressure: a response not sent fast enough pauses the body until it got drained (a drain listener only then,
   // instead of one for every response)
@@ -448,6 +540,19 @@ export const createResponseToNodeResponseEmitter = (
       throw new Error('Response body has already been destroyed');
     }
 
+    // a locked web stream cannot be converted with Readable.fromWeb: thrown before writeHead so headers are not
+    // sent and no send timeout is leaked
+    if (response.body instanceof ReadableStream && response.body.locked) {
+      throw new Error('Response body is locked');
+    }
+
+    // client already disconnected before the handler returned: cancel the body without writing or starting a timer
+    if (nodeResponse.closed || nodeResponse.destroyed) {
+      cancelBody(response.body);
+
+      return;
+    }
+
     // node rejects control characters within header values and a status outside 100-999:
     // writeHead can therefore throw for a constructed Response; cancel the potentially
     // connection-backed body before surfacing the error, nothing has been sent to the client yet
@@ -459,6 +564,8 @@ export const createResponseToNodeResponseEmitter = (
       throw error;
     }
 
+    const body = toReadable(response.body);
+
     // slowloris protection: a client reading the response arbitrarily slow (or a stalling response
     // body stream) would otherwise keep the response (and its socket) alive forever
     // without a closure per response, gets cleared by the close listener of sendBody
@@ -467,6 +574,6 @@ export const createResponseToNodeResponseEmitter = (
         ? setTimeout(destroyNotSentResponse, responseSendTimeoutMs, nodeResponse, responseSendTimeoutMs).unref()
         : undefined;
 
-    sendBody(toReadable(response.body), nodeResponse, timeout);
+    sendBody(body, nodeResponse, timeout);
   };
 };

@@ -37,7 +37,7 @@ injected `UriFactory`, `ServerRequestFactory` and `RequestHelpers` (or `ServerRe
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-http-node][1].
 
 ```sh
-npm i @chubbyts/chubbyts-http-node@^1.1.7
+npm i @chubbyts/chubbyts-http-node@^1.2.0
 ```
 
 ## Usage
@@ -94,6 +94,10 @@ const server = createServer(async (req, res) => {
     responseToNodeResponseEmitter(response, res);
   } catch (error) {
     console.error(`Failed to handle request: ${error}`);
+
+    if (res.destroyed || res.closed) {
+      return;
+    }
 
     // once headers are sent the response cannot be turned into a 500 anymore:
     // destroying the socket is the only way to signal the failure to the client
